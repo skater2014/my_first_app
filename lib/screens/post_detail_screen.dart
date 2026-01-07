@@ -8,6 +8,7 @@ import '../model/banner.dart';
 import '../service/wp_api_service.dart';
 import '../widgets/wp_tables.dart';
 import 'category_post_list_screen.dart';
+import '../widgets/gw_post_slider.dart';
 
 class PostDetailScreen extends StatefulWidget {
   final Post post;
@@ -332,6 +333,16 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
   Widget build(BuildContext context) {
     final html = widget.post.contentHtml;
 
+    debugPrint(
+      'sliderItems=${widget.post.sliderItems.length} postId=${widget.post.id}',
+    );
+
+    // ✅ 追加：記事スライダー配列（無い記事は []）
+    final sliderItems = widget.post.sliderItems;
+
+    // ✅ 判定（スライダーがあるか）
+    final hasPostSlider = sliderItems.isNotEmpty;
+
     return Scaffold(
       appBar: AppBar(
         title: Text(
@@ -349,7 +360,12 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _headerMedia(),
+                  // ✅ ここで判別して差し込む
+                  if (hasPostSlider)
+                    GwPostSlider(items: sliderItems)
+                  else
+                    _headerMedia(),
+
                   const SizedBox(height: 12),
 
                   Padding(

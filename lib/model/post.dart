@@ -1,4 +1,8 @@
+import 'gw_slider_item.dart';
 // lib/model/post.dart
+
+// ✅ 追加：スライダー1枚ぶんのモデル＆抽出関数を使う
+// ※ ファイル名はあなたが作ったものに合わせてね
 
 class Post {
   final int id;
@@ -14,7 +18,7 @@ class Post {
 
   final int likeCount;
   final bool showInHomepage;
-  final bool showInSlider;
+  final bool showInSlider; // ※ これは「ホームなどのスライダー表示フラグ」(既存用途) のまま
 
   final String? pageFeaturedType;
   final String? pageVideoId;
@@ -23,6 +27,11 @@ class Post {
   /// ✅ YouTube動画として扱うためのID（基本はこれだけ見ればOK）
   /// - pageVideoId が入っていれば youtubeId に入れる方針（type未設定でも消えない）
   final String? youtubeId;
+
+  /// ✅ 追加：記事内/記事上部で使う「複数メディアのスライダー」
+  /// - WPの REST レスポンス内の gw_slider_items（配列）をここに入れる
+  /// - 無い記事は []（空配列）になるので、UI側は hasPostSlider で判定できる
+  final List<GwSliderItem> sliderItems;
 
   Post({
     required this.id,
@@ -40,11 +49,19 @@ class Post {
     required this.pageVideoId,
     required this.mediaId,
     required this.youtubeId,
+
+    /// ✅ 追加：既存の呼び出し側を壊さないために optional + default にする
+    /// - これにより Post(...) を作ってる他の箇所を全部直さなくて済む
+    this.sliderItems = const [],
   });
 
   // ✅ getter追加：UI側が読みやすくなる
   bool get hasVideo => (youtubeId ?? '').trim().isNotEmpty;
   bool get hasImage => (imageUrl ?? '').trim().isNotEmpty;
+
+  /// ✅ 追加：記事スライダーがあるかどうか（最重要の判別用）
+  /// - PostDetailScreen ではこれが true のときだけ GwPostSlider を表示すればOK
+  bool get hasPostSlider => sliderItems.isNotEmpty;
 
   factory Post.fromJson(Map<String, dynamic> json) {
     // meta を安全に取得（無い/型違い対策）
@@ -127,6 +144,15 @@ class Post {
         // 将来：youtube以外を弾きたいならここで null にする
         return videoId;
       })(),
+
+      // ✅ 追加：記事JSONから「gw_slider_items」を抜いて List<GwSliderItem> に変換
+      // - 取り出し関数 extractGwSliderItems は以下のどれかを自動で探す想定：
+      //   1) json["gw_slider_items"]
+      //   2) json["meta"]["gw_slider_items"]
+      //   3) json["acf"]["gw_slider_items"]
+      //
+      // - 無い/型が違う場合は [] が返るので安全（記事にスライダーが無いケース）
+      sliderItems: extractGwSliderItems(json),
     );
   }
 }
