@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "581552304160",
+    "project_id": "gaming-blog-7730f",
+    "storage_bucket": "gaming-blog-7730f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:581552304160:android:5eb4a8fbc1b9c125ae8c45",
+        "android_client_info": {
+          "package_name": "com.gamewidth.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBX0GuYUb4eXceexoF9tY1Y-i_1afRxBxg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:581552304160:android:249114425ded9a38ae8c45",
+        "android_client_info": {
+          "package_name": "net.gamewidth"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBX0GuYUb4eXceexoF9tY1Y-i_1afRxBxg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
