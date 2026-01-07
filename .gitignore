@@ -14,3 +14,12 @@ ios/.symlinks/
 *.apk
 *.aab
 *.dill
+
+# --- allow Flutter web build for Vercel ---
+!build/web/
+!build/web/**
+
+# keep Android huge stuff out
+build/app/
+build/**/intermediates/
+build/**/merged_native_libs/
