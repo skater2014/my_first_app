@@ -1,17 +1,19 @@
 name: my_first_app
 description: "A new Flutter project."
 publish_to: "none"
-
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.10.3
+  sdk: ">=3.10.0 <4.0.0"
 
 dependencies:
   flutter:
     sdk: flutter
 
   cupertino_icons: ^1.0.8
+
+  # URL open (link tap)
+  url_launcher: ^6.3.0
 
   # Firebase / GA4
   firebase_core: ^4.3.0
@@ -20,7 +22,7 @@ dependencies:
   # REST API
   http: ^1.6.0
 
-  # WebView
+  # WebView (optional: open links inside app if you want)
   webview_flutter: ^4.7.0
 
   # Image cache
@@ -31,10 +33,10 @@ dependencies:
 
   # YouTube
   youtube_player_flutter: ^9.0.0
+  youtube_player_iframe: ^5.2.0
 
-  # HTML
+  # HTML renderer（←これ1本に統一）
   flutter_html: ^3.0.0
-  flutter_html_table: ^3.0.0
 
   # Visibility
   visibility_detector: ^0.4.0
@@ -42,10 +44,11 @@ dependencies:
   # HTML parser
   html: ^0.15.4
 
+  dotted_border: ^3.1.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
-
   flutter_lints: ^6.0.0
 
 flutter:

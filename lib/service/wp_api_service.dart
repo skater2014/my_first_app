@@ -1,113 +1,188 @@
 // lib/service/wp_api_service.dart
+//
+// =============================================================
+// ✅ 役割：WordPress / 自作REST API を叩く “通信の司令塔”
+// =============================================================
+//
+// ✅ 方針（超重要）
+// - screens/ にはHTTP処理を書かない
+// - 画面は「このファイルの関数を呼ぶだけ」
+// - URL/例外/パラメータはここに集約して、修正点を1箇所に閉じ込める
+//
+// ✅ このファイルが担当するAPI
+// 1) WordPress標準 REST API（/wp-json/wp/v2/...）
+//    - posts / comments / categories など
+//
+// 2) あなたの自作 REST API（/wp-json/gwc/v1/...）
+//    - characters / like など
+//
+// 3) （任意）Reset API（/wp-json/gw/v1/reset など）
+// =============================================================
+
 import 'dart:convert';
 import 'dart:math';
 
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../constants.dart';
-import '../model/post.dart';
-import '../model/comment.dart';
+import '../constants.dart'; // siteBaseUrl / wpV2BaseUrl / gwcV1BaseUrl / scrollBannerApiUrl / AppLang
 import '../model/banner.dart';
+import '../model/comment.dart';
+import '../model/gwc_character.dart';
+import '../model/post.dart';
 
-/// WordPress REST API を叩くサービス
-///
-/// ==========================================================
-/// ✅ このクラスの目的（このアプリの根っこ）
-/// ==========================================================
-/// 1) 投稿一覧を取る（複数 post_type を混ぜる）
-///    - タイムライン / Explore / Search で使う
-///
-/// 2) いいねを送信する（device_idで重複防止）
-///
-/// 3) コメントを取得/投稿する
-///
-/// 4) スクロールバナーを取得する
-///
-/// ==========================================================
-/// ✅ ここが重要（あなたの混乱ポイント）
-/// ==========================================================
-/// ● 「検索一覧で genshin_updated が出ない」理由は、
-///   そもそも検索対象 REST に genshin_updated を含めていないから。
-///
-/// ● ただし「含めたのに出ない」場合はWP側の設定問題：
-///   - show_in_rest = true になってない
-///   - RESTのパス名（rest_base）が post_type と一致していない
-///
-/// 例：
-///   register_post_type('genshin_updated', [
-///     'show_in_rest' => true,
-///     'rest_base'    => 'genshin_updated', // ←これが違うと404
-///   ]);
-///
-///   ✅ まずブラウザで確認：
-///   https://あなたのドメイン/wp-json/wp/v2/genshin_updated
-///   - 200 → Flutter側で出せる
-///   - 404 → WP側のrest_baseが違う or REST無効
-///
-/// ==========================================================
-/// ✅ さらに重要（検索順の話）
-/// ==========================================================
-/// 「sortByDate=falseにしたから WPの検索順を尊重できる」
-/// → これは “単一post_typeだけ” なら正しい。
-///
-/// でも複数post_typeを合体すると、
-/// 全体の並びは “WPの関連順” にはならない。
-///
-/// なぜなら：
-///   postsの結果 + guの結果 + gu-jpの結果 + ... を
-///   「配列をくっつけた順」で並ぶから。
-///
-/// ✅ だから「tekken7が後ろに流れる」のは普通に起きる。
-///
-/// → 真の関連順が必要なら、後で
-///   - WP側で統合検索APIを作る
-///   - もしくは Flutter側で簡易スコアリング（タイトル一致優先など）
-///   のどちらかが必要。
+/// =============================================================
+/// ✅ 共通：HTTP例外（本文を短縮して保持）
+/// =============================================================
+class ApiException implements Exception {
+  final int statusCode;
+  final String url;
+  final String bodySnippet;
+
+  ApiException({
+    required this.statusCode,
+    required this.url,
+    required this.bodySnippet,
+  });
+
+  @override
+  String toString() => 'HTTP $statusCode: $url :: $bodySnippet';
+}
+
+/// =============================================================
+/// ✅ 共通ユーティリティ（ログ・本文短縮）
+/// =============================================================
+String _snip(String s, [int max = 400]) {
+  final t = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (t.length <= max) return t;
+  return '${t.substring(0, max)}...';
+}
+
+void _log(bool enabled, String msg) {
+  if (!enabled) return;
+  // ignore: avoid_print
+  print(msg);
+}
+
+/// =============================================================
+/// ✅ WordPress標準 API（wp/v2）を叩くクラス
+/// =============================================================
 class WpApiService {
+  // ==========================================================
+  // ✅ 速度/安定性のための方針
+  // ==========================================================
+  static final http.Client _sharedClient = http.Client();
+
+  static final Map<String, _CacheEntry> _memCache = <String, _CacheEntry>{};
+  static const Duration _defaultCacheTtl = Duration(seconds: 20);
+
   final http.Client _client;
+  final bool logEnabled;
 
-  WpApiService({http.Client? client}) : _client = client ?? http.Client();
+  WpApiService({http.Client? client, this.logEnabled = false})
+    : _client = client ?? _sharedClient;
 
   // ==========================================================
-  // ✅ ここが本体：横断対象の REST base 一覧
+  // ✅ 横断検索に使うREST base（言語別）
   // ==========================================================
-  //
-  // 目的：
-  // - タイムライン/Explore/Search で “対象にしたい投稿タイプ” を
-  //   ここに全部並べる
-  //
-  // 注意：
-  // - ここに書いた文字列は “post_type名” ではなく
-  //   “RESTのパス名(rest_base)” を想定
-  //
-  // 例：
-  // - 標準投稿: posts
-  // - CPT: gu, gu-jp, genshin_updated, ...
-  //
-  // ✅ もし 404 が出るなら、WP側の rest_base を確認してここを合わせる
-  static const List<String> _restBases = [
+  static const List<String> _restBasesEn = <String>[
     'posts',
     'gu',
-    'gu-jp',
     'genshin_updated',
+    'artifacts',
+  ];
+
+  static const List<String> _restBasesJa = <String>[
+    'posts',
+    'gu-jp',
     'genshin_updated_jp',
     'artifacts',
   ];
 
+  List<String> _basesByLang(AppLang lang) =>
+      (lang == AppLang.ja) ? _restBasesJa : _restBasesEn;
+
   // ==========================================================
-  // ✅ 共通：特定のREST baseから投稿を取って Post リストにする
+  // ✅ 共通：GETしてJSONを返す（Map or List）
+  // ==========================================================
+  Future<dynamic> _getJson(
+    Uri uri, {
+    Map<String, String>? headers,
+    Duration? cacheTtl,
+  }) async {
+    final h = headers ?? const {'accept': 'application/json'};
+    final ttl = cacheTtl ?? _defaultCacheTtl;
+
+    final key = uri.toString();
+    final now = DateTime.now();
+
+    final hit = _memCache[key];
+    if (hit != null && hit.expiresAt.isAfter(now)) {
+      _log(logEnabled, '🧠 CACHE HIT $uri');
+      return hit.data;
+    }
+
+    _log(logEnabled, '➡️ GET $uri');
+    final res = await _client.get(uri, headers: h);
+
+    if (res.statusCode != 200) {
+      throw ApiException(
+        statusCode: res.statusCode,
+        url: uri.toString(),
+        bodySnippet: _snip(res.body),
+      );
+    }
+
+    final decoded = jsonDecode(res.body);
+
+    if (ttl > Duration.zero) {
+      _memCache[key] = _CacheEntry(decoded, now.add(ttl));
+    }
+
+    return decoded;
+  }
+
+  // ==========================================================
+  // ✅ 共通：wp/v2 の任意endpoint + query で Post[] を取る（汎用）
   // ==========================================================
   //
-  // 目的：
-  // - fetchAllPosts と searchAllPosts の両方で同じ処理を使う
-  //
-  // ポリシー：
-  // - 失敗しても例外で落とさず「空配列」で返す（アプリを止めない）
-  //
-  // 注意：
-  // - per_page/page は WP REST の制約を受ける（上限など）
-  // - searchQuery は WP標準の全文検索（タイトル/本文など対象）
+  // 画面や他のメソッドは「postsを取る」なら基本ここに寄せる。
+  Future<List<Post>> fetchPostsByQuery(
+    Map<String, String> queryParameters, {
+    String base = 'posts',
+    bool homepageOnly = false,
+    AppLang? lang,
+  }) async {
+    // ※ WP側に lang クエリが必要ならここで付与できる（Polylang等）
+    final qp = <String, String>{
+      '_embed': '1',
+      ...queryParameters,
+      if (lang != null) 'lang': lang.code,
+    };
+
+    final uri = Uri.parse('$wpV2BaseUrl/$base').replace(queryParameters: qp);
+    final raw = await _getJson(uri);
+
+    if (raw is! List) {
+      return <Post>[];
+    }
+
+    final list = raw
+        .whereType<Map>()
+        .map((e) => Post.fromJson(e.cast<String, dynamic>()))
+        .toList();
+
+    final posts = homepageOnly
+        ? list.where((p) => p.showInHomepage == true).toList()
+        : list;
+
+    posts.sort((a, b) => b.date.compareTo(a.date));
+    return posts;
+  }
+
+  // ==========================================================
+  // ✅ 共通：特定REST baseから投稿を取る（失敗しても空配列）
+  // ==========================================================
   Future<List<Post>> _fetchPostsFromBase(
     String base, {
     required int perPage,
@@ -115,213 +190,214 @@ class WpApiService {
     String? searchQuery,
   }) async {
     try {
-      // ----------------------------
-      // クエリパラメータを組み立てる
-      // ----------------------------
-      //
-      // _embed=1:
-      //   - アイキャッチ画像など埋め込み情報を取りたい時に便利
-      //
-      // per_page/page:
-      //   - ページング
-      //
-      // search:
-      //   - WordPress標準の検索（全文検索）
-      final qp = <String>['_embed=1', 'per_page=$perPage', 'page=$page'];
+      final qp = <String, String>{
+        '_embed': '1',
+        'per_page': '$perPage',
+        'page': '$page',
+        if (searchQuery != null && searchQuery.trim().isNotEmpty)
+          'search': searchQuery.trim(),
+      };
 
-      if (searchQuery != null && searchQuery.trim().isNotEmpty) {
-        // ✅ URLエンコード（スペースや記号対策）
-        final q = Uri.encodeQueryComponent(searchQuery.trim());
-        qp.add('search=$q');
-      }
+      final uri = Uri.parse('$wpV2BaseUrl/$base').replace(queryParameters: qp);
+      final raw = await _getJson(uri);
 
-      // 例: https://example.com/wp-json/wp/v2/posts?_embed=1&per_page=30&page=1&search=genshin
-      final uri = Uri.parse('$wpBaseUrl/$base?${qp.join("&")}');
+      if (raw is! List) return <Post>[];
 
-      final res = await _client.get(uri);
-
-      // ✅ 200以外は “その投稿タイプは取れない” とみなして空で返す
-      if (res.statusCode != 200) return [];
-
-      final List<dynamic> list = jsonDecode(res.body) as List<dynamic>;
-
-      // ✅ JSON → Post モデル
-      return list.map((e) => Post.fromJson(e as Map<String, dynamic>)).toList();
+      return raw
+          .whereType<Map>()
+          .map((e) => Post.fromJson(e.cast<String, dynamic>()))
+          .toList();
     } catch (_) {
-      // ネットワーク障害 / JSON壊れ / 404など全部ここに来る
-      return [];
+      return <Post>[];
     }
   }
 
   // ----------------------------------------------------------------------
-  // ① 通常投稿だけの一覧（関連記事用など）
+  // ① 通常投稿だけの一覧（postsのみ）
   // ----------------------------------------------------------------------
-  //
-  // 目的：
-  // - “postsだけ” が欲しい場面用（関連記事など）
-  //
-  // 注意：
-  // - この関数は CPT を混ぜない（posts専用）
-  Future<List<Post>> fetchLatestPosts({int page = 1, int perPage = 10}) async {
-    final uri = Uri.parse(
-      '$wpBaseUrl/posts?_embed=1&per_page=$perPage&page=$page',
-    );
-    final res = await _client.get(uri);
-
-    if (res.statusCode != 200) {
-      throw Exception('Failed to load posts: ${res.statusCode}');
-    }
-
-    final List<dynamic> data = jsonDecode(res.body) as List<dynamic>;
-    return data
-        .map((json) => Post.fromJson(json as Map<String, dynamic>))
-        .toList();
+  Future<List<Post>> fetchLatestPosts({int page = 1, int perPage = 10}) {
+    return fetchPostsByQuery(<String, String>{
+      'per_page': '$perPage',
+      'page': '$page',
+    }, base: 'posts');
   }
 
   // ----------------------------------------------------------------------
-  // ② 複数post_typeをまとめて取得（タイムライン/Explore用）
+  // ② 複数baseをまとめて取得（Explore用）
+  // ✅ lang で base を分ける（EN/JPを混ぜない）
+  // ✅ idで重複排除
   // ----------------------------------------------------------------------
-  //
-  // 目的：
-  // - Explore や タイムラインで “全部混ぜて” 表示する
-  //
-  // ポリシー：
-  // - ここは日付順でOK（新しい順）
-  //
-  // 注意：
-  // - WPは投稿タイプごとに別エンドポイントなので
-  //   Future.waitで並列取得 → 合体 → 日付ソート、という流れにする
-  Future<List<Post>> fetchAllPosts({int perPage = 50}) async {
-    // ✅ 全REST baseを並列で取得（速い）
+  Future<List<Post>> fetchAllPosts({
+    int perPage = 30,
+    AppLang lang = AppLang.en,
+  }) async {
+    final bases = _basesByLang(lang);
+
     final lists = await Future.wait(
-      _restBases.map((b) => _fetchPostsFromBase(b, perPage: perPage)),
+      bases.map((b) => _fetchPostsFromBase(b, perPage: perPage)),
     );
 
-    // ✅ 合体
-    final allPosts = <Post>[];
+    final all = <Post>[];
     for (final l in lists) {
-      allPosts.addAll(l);
+      all.addAll(l);
     }
 
-    // ✅ 重複除去（安全策）
-    //
-    // 目的：
-    // - 何らかの理由で同じIDが混ざった時に、Grid/Listで変な挙動を防ぐ
     final seen = <int>{};
     final unique = <Post>[];
-    for (final p in allPosts) {
+    for (final p in all) {
       if (seen.add(p.id)) unique.add(p);
     }
 
-    // ✅ 新しい順
     unique.sort((a, b) => b.date.compareTo(a.date));
     return unique;
   }
 
   // ----------------------------------------------------------------------
+  // ✅ Timeline用（軽量）
+  // - posts だけ取得
+  // - showInHomepage=true をここでフィルタ
+  // ----------------------------------------------------------------------
+  Future<List<Post>> fetchHomepagePosts({
+    int perPage = 30,
+    int page = 1,
+    AppLang lang = AppLang.en,
+  }) async {
+    final posts = await fetchPostsByQuery(
+      <String, String>{'per_page': '$perPage', 'page': '$page'},
+      base: 'posts',
+      homepageOnly: true,
+      lang: lang,
+    );
+
+    return posts;
+  }
+
+  // ----------------------------------------------------------------------
+  // ✅ Timeline/ページング用（TimelineScreen が呼ぶ）
+  // ----------------------------------------------------------------------
+  Future<List<Post>> fetchPostsPage({
+    required int page,
+    int perPage = 20,
+    bool homepageOnly = false,
+    AppLang lang = AppLang.en,
+  }) async {
+    return fetchPostsByQuery(
+      <String, String>{'per_page': '$perPage', 'page': '$page'},
+      base: 'posts',
+      homepageOnly: homepageOnly,
+      lang: lang,
+    );
+  }
+
+  // ----------------------------------------------------------------------
   // ③ いいね API（/wp-json/gwc/v1/like）
   // ----------------------------------------------------------------------
-  //
-  // 目的：
-  // - Flutterから “いいね” を送って WordPress側で加算する
-  //
-  // 注意：
-  // - device_id を送って、同じ端末が連打しても増えないようにする
   Future<int> sendLike(int postId) async {
     final deviceId = await _getDeviceId();
+    final uri = Uri.parse('$gwcV1BaseUrl/like');
 
-    // wpBaseUrl 例： https://example.com/wp-json/wp/v2
-    // これを https://example.com/wp-json に戻す（カスタムルート用）
-    final restBase = wpBaseUrl.replaceFirst(RegExp(r'/wp/v2/?$'), '');
-    final uri = Uri.parse('$restBase/gwc/v1/like');
+    _log(logEnabled, '➡️ POST $uri');
 
     final response = await _client.post(
       uri,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'post_id': postId, 'device_id': deviceId}),
+      headers: const <String, String>{
+        'Content-Type': 'application/json',
+        'accept': 'application/json',
+      },
+      body: jsonEncode(<String, dynamic>{
+        'post_id': postId,
+        'device_id': deviceId,
+      }),
     );
 
     if (response.statusCode != 200) {
-      throw Exception('Like API error: ${response.statusCode}');
+      throw ApiException(
+        statusCode: response.statusCode,
+        url: uri.toString(),
+        bodySnippet: _snip(response.body),
+      );
     }
 
-    final Map<String, dynamic> json =
-        jsonDecode(response.body) as Map<String, dynamic>;
+    final raw = jsonDecode(response.body);
+    if (raw is! Map) {
+      throw Exception('Unexpected JSON shape: ${raw.runtimeType}');
+    }
 
-    // APIが { count: 123 } を返す想定
-    return (json['count'] ?? 0) as int;
+    final map = raw.cast<String, dynamic>();
+    final count = map['count'] ?? 0;
+
+    if (count is int) return count;
+    if (count is String) return int.tryParse(count) ?? 0;
+    return 0;
   }
 
   // ----------------------------------------------------------------------
   // ④ device_id（いいね重複防止）
   // ----------------------------------------------------------------------
   //
-  // 目的：
-  // - 端末固有IDを SharedPreferences に保存して再利用する
-  //
-  // ポリシー：
-  // - 一度作ったらずっと同じID（アプリ再起動でも保持）
+  // ✅ Webでの RangeError 回避：
+  // - 2^32 の nextInt は JS変換で事故ることがある
+  // - 2^31-1（0x7fffffff）なら安全
   Future<String> _getDeviceId() async {
     const key = 'gwc_device_id';
     final prefs = await SharedPreferences.getInstance();
     final existing = prefs.getString(key);
 
-    if (existing != null && existing.isNotEmpty) return existing;
+    if (existing != null && existing.isNotEmpty) {
+      return existing;
+    }
 
-    final random = Random();
+    final r = Random();
     final newId =
-        'dev-${DateTime.now().millisecondsSinceEpoch}-${random.nextInt(1 << 32)}';
+        'dev-${DateTime.now().millisecondsSinceEpoch}-${r.nextInt(0x7fffffff)}';
     await prefs.setString(key, newId);
     return newId;
   }
 
   // ----------------------------------------------------------------------
-  // ⑤ コメント一覧
+  // ⑤ コメント一覧（wp/v2）
   // ----------------------------------------------------------------------
-  //
-  // 目的：
-  // - 投稿詳細でコメントを表示する
-  //
-  // order=asc:
-  // - 古い→新しい順（会話が読みやすい）
   Future<List<Comment>> fetchComments(int postId) async {
-    final uri = Uri.parse(
-      '$wpBaseUrl/comments?post=$postId&per_page=100&orderby=date&order=asc',
+    final uri = Uri.parse('$wpV2BaseUrl/comments').replace(
+      queryParameters: <String, String>{
+        'post': '$postId',
+        'per_page': '30',
+        'orderby': 'date',
+        'order': 'asc',
+      },
     );
 
-    final response = await _client.get(uri);
-    if (response.statusCode != 200) {
-      throw Exception('Failed to load comments: ${response.statusCode}');
+    final raw = await _getJson(uri);
+    if (raw is! List) {
+      throw Exception('Unexpected JSON shape: ${raw.runtimeType}');
     }
 
-    final List<dynamic> jsonList = jsonDecode(response.body) as List<dynamic>;
-    return jsonList
-        .map((e) => Comment.fromJson(e as Map<String, dynamic>))
+    return raw
+        .whereType<Map>()
+        .map((e) => Comment.fromJson(e.cast<String, dynamic>()))
         .toList();
   }
 
   // ----------------------------------------------------------------------
-  // ⑥ コメント投稿
+  // ⑥ コメント投稿（wp/v2）
   // ----------------------------------------------------------------------
-  //
-  // 目的：
-  // - Flutterからコメントを送る
-  //
-  // 注意：
-  // - WP側の設定によっては認証が必要な場合もある
-  // - 今は “匿名投稿できる設定” を前提にしている
   Future<void> postComment({
     required int postId,
     required String authorName,
     required String authorEmail,
     required String content,
   }) async {
-    final uri = Uri.parse('$wpBaseUrl/comments');
+    final uri = Uri.parse('$wpV2BaseUrl/comments');
+
+    _log(logEnabled, '➡️ POST $uri');
 
     final response = await _client.post(
       uri,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
+      headers: const <String, String>{
+        'Content-Type': 'application/json',
+        'accept': 'application/json',
+      },
+      body: jsonEncode(<String, dynamic>{
         'post': postId,
         'author_name': authorName,
         'author_email': authorEmail,
@@ -330,32 +406,26 @@ class WpApiService {
     );
 
     if (response.statusCode != 201 && response.statusCode != 200) {
-      throw Exception('Failed to post comment: status ${response.statusCode}');
+      throw ApiException(
+        statusCode: response.statusCode,
+        url: uri.toString(),
+        bodySnippet: _snip(response.body),
+      );
     }
   }
 
   // ----------------------------------------------------------------------
-  // ⑦ バナー
+  // ⑦ バナー（プラグイン）
   // ----------------------------------------------------------------------
-  //
-  // 目的：
-  // - スクロールバナー設定をWPから取得する
-  //
-  // ポリシー：
-  // - 失敗しても null（バナー無しで動く）
   Future<ScrollBanner?> fetchScrollBanner() async {
     try {
       final uri = Uri.parse(scrollBannerApiUrl);
-      final res = await _client.get(uri);
+      final raw = await _getJson(uri);
 
-      if (res.statusCode != 200) return null;
+      if (raw is! Map) return null;
 
-      final dynamic raw = jsonDecode(res.body);
-      if (raw is! Map<String, dynamic>) return null;
-
-      final banner = ScrollBanner.fromJson(raw);
-
-      // ✅ shouldShow=falseなら表示しない（null扱い）
+      final map = raw.cast<String, dynamic>();
+      final banner = ScrollBanner.fromJson(map);
       if (!banner.shouldShow) return null;
 
       return banner;
@@ -365,80 +435,53 @@ class WpApiService {
   }
 
   // ----------------------------------------------------------------------
-  // ⑧ 通常カテゴリ slug から post 一覧を取る（posts専用）
+  // ⑧ カテゴリ slug → posts 一覧（wp/v2）
   // ----------------------------------------------------------------------
-  //
-  // 目的：
-  // - バナーのリンクなどからカテゴリ一覧へ飛ぶ場合に使う
-  //
-  // 注意：
-  // - これは “postsのカテゴリ” 前提
-  // - CPT側のカテゴリ体系を使うなら別実装が必要
   Future<List<Post>> fetchPostsByCategorySlug(
     String slug, {
     int perPage = 20,
   }) async {
-    final catUri = Uri.parse('$wpBaseUrl/categories?slug=$slug');
-    final catRes = await _client.get(catUri);
+    final catUri = Uri.parse(
+      '$wpV2BaseUrl/categories',
+    ).replace(queryParameters: <String, String>{'slug': slug});
 
-    if (catRes.statusCode != 200) {
-      throw Exception('Failed to load category: ${catRes.statusCode}');
+    final catRaw = await _getJson(catUri);
+    if (catRaw is! List) {
+      throw Exception('Unexpected JSON shape: ${catRaw.runtimeType}');
+    }
+    if (catRaw.isEmpty) return <Post>[];
+
+    final first = catRaw.first;
+    if (first is! Map) {
+      throw Exception('Unexpected category item: ${first.runtimeType}');
     }
 
-    final List<dynamic> catJson = jsonDecode(catRes.body) as List<dynamic>;
-    if (catJson.isEmpty) return [];
+    final catId = (first as Map)['id'];
 
-    final int catId = catJson.first['id'] as int;
-
-    final postsUri = Uri.parse(
-      '$wpBaseUrl/posts?_embed=1&per_page=$perPage&categories=$catId',
-    );
-    final postsRes = await _client.get(postsUri);
-
-    if (postsRes.statusCode != 200) {
-      throw Exception('Failed to load category posts: ${postsRes.statusCode}');
-    }
-
-    final List<dynamic> postsJson = jsonDecode(postsRes.body) as List<dynamic>;
-    return postsJson
-        .map((e) => Post.fromJson(e as Map<String, dynamic>))
-        .toList();
+    return fetchPostsByQuery(<String, String>{
+      'per_page': '$perPage',
+      'categories': '$catId',
+    }, base: 'posts');
   }
 
   // ----------------------------------------------------------------------
-  // ✅ 横断検索（複数post_type）
+  // ✅ 横断検索（複数base）
+  // ✅ lang で対象baseを切替（EN/JP混在防止）
   // ----------------------------------------------------------------------
-  //
-  // 目的：
-  // - SearchScreen から呼ばれて、キーワード検索結果を返す
-  //
-  // “search” の正体：
-  // - WordPress標準 `?search=` パラメータ（全文検索）
-  // - タイトル/本文などが対象
-  //
-  // ✅ 重要：並びの話（あなたが混乱していたポイント）
-  // - sortByDate=false にしても、複数post_typeを合体した時点で
-  //   “全体としての関連順” にはならない。
-  //
-  // なぜ：
-  // - postsの結果 → guの結果 → ... を単純に「順番にくっつける」から。
-  //
-  // ✅ 改善したい場合：
-  // - Flutter側で “簡易スコアリング” を入れる
-  //   (タイトル完全一致 > タイトル部分一致 > 本文一致 など)
-  // - または WP側に “統合検索API” を作って、サーバー側で関連順を返す
   Future<List<Post>> searchAllPosts({
     required String query,
-    int perPage = 30,
+    int perPage = 20,
     int page = 1,
     bool sortByDate = false,
+    AppLang lang = AppLang.en,
   }) async {
     final trimmed = query.trim();
-    if (trimmed.isEmpty) return [];
+    if (trimmed.isEmpty) return <Post>[];
 
-    // ✅ 全post_type（REST base）で並列検索
+    final bases = _basesByLang(lang);
+
     final lists = await Future.wait(
-      _restBases.map(
+      bases.map(
         (b) => _fetchPostsFromBase(
           b,
           perPage: perPage,
@@ -448,24 +491,188 @@ class WpApiService {
       ),
     );
 
-    // ✅ 合体
     final all = <Post>[];
     for (final l in lists) {
       all.addAll(l);
     }
 
-    // ✅ 重複除去（安全策）
     final seen = <int>{};
     final unique = <Post>[];
     for (final p in all) {
       if (seen.add(p.id)) unique.add(p);
     }
 
-    // ✅ 必要なら日付順（ただし関連順は壊れる）
     if (sortByDate) {
       unique.sort((a, b) => b.date.compareTo(a.date));
     }
 
     return unique;
   }
+
+  // ----------------------------------------------------------------------
+  // ✅ （任意）Reset API
+  // ----------------------------------------------------------------------
+  Future<Map<String, dynamic>> fetchReset({AppLang? lang}) async {
+    final uri = Uri.parse('$siteBaseUrl/wp-json/gw/v1/reset').replace(
+      queryParameters: <String, String>{if (lang != null) 'lang': lang.code},
+    );
+
+    final raw = await _getJson(uri);
+
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) return raw.cast<String, dynamic>();
+
+    throw Exception('Reset API unexpected JSON shape: ${raw.runtimeType}');
+  }
+}
+
+/// =============================================================
+/// ✅ 自作「GWC Characters API」（gwc/v1）を叩くクラス
+/// =============================================================
+class GwcApi {
+  final http.Client _client;
+  final String _base;
+  final bool logEnabled;
+
+  GwcApi({http.Client? client, String? baseOverride, this.logEnabled = false})
+    : _client = client ?? http.Client(),
+      _base = baseOverride ?? gwcV1BaseUrl;
+
+  String _langParam(AppLang lang) => (lang == AppLang.ja) ? 'ja' : 'en';
+
+  Uri _u(String path, Map<String, String> q) {
+    final full = '$_base/$path';
+    return Uri.parse(full).replace(queryParameters: q);
+  }
+
+  List<Map<String, dynamic>> _extractItems(dynamic raw) {
+    if (raw is Map<String, dynamic> && raw['items'] is List) {
+      final list = raw['items'] as List;
+      return list
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList();
+    }
+    if (raw is Map && raw['items'] is List) {
+      final list = raw['items'] as List;
+      return list
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList();
+    }
+    if (raw is List) {
+      return raw
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList();
+    }
+    throw Exception('Unexpected JSON shape: ${raw.runtimeType}');
+  }
+
+  Future<dynamic> _getJson(Uri uri) async {
+    _log(logEnabled, '➡️ GET $uri');
+
+    final res = await _client.get(
+      uri,
+      headers: const <String, String>{'accept': 'application/json'},
+    );
+
+    if (res.statusCode != 200) {
+      throw ApiException(
+        statusCode: res.statusCode,
+        url: uri.toString(),
+        bodySnippet: _snip(res.body),
+      );
+    }
+
+    return jsonDecode(res.body);
+  }
+
+  Future<List<GwcCharacter>> fetchCharacters({
+    required int page,
+    int perPage = 20,
+    bool full = false,
+    bool includeHtml = false,
+    String? search,
+    String? element,
+    String? weaponType,
+    String? rarity,
+    String? role,
+    String sort = 'updated', // name|rarity|updated
+    String order = 'desc', // asc|desc
+    AppLang lang = AppLang.en,
+  }) async {
+    const allowedSort = <String>{'name', 'rarity', 'updated'};
+    final s = allowedSort.contains(sort) ? sort : 'updated';
+    final o = (order.toLowerCase() == 'desc') ? 'desc' : 'asc';
+
+    final q = <String, String>{
+      'page': '$page',
+      'per_page': '$perPage',
+      'full': full ? '1' : '0',
+      'include_html': includeHtml ? '1' : '0',
+      'lang': _langParam(lang),
+      if (search != null && search.trim().isNotEmpty) 'search': search.trim(),
+      if (element != null && element.trim().isNotEmpty)
+        'element': element.trim(),
+      if (weaponType != null && weaponType.trim().isNotEmpty)
+        'weapon_type': weaponType.trim(),
+      if (rarity != null && rarity.trim().isNotEmpty) 'rarity': rarity.trim(),
+      if (role != null && role.trim().isNotEmpty) 'role': role.trim(),
+      'sort': s,
+      'order': o,
+    };
+
+    final uri = _u('characters', q);
+    final raw = await _getJson(uri);
+
+    final items = _extractItems(raw);
+    return items.map(GwcCharacter.fromJson).toList();
+  }
+
+  Future<GwcCharacter> fetchCharacterById(
+    int id, {
+    AppLang? lang,
+    bool full = true,
+    bool includeHtml = false,
+  }) async {
+    final q = <String, String>{
+      'full': full ? '1' : '0',
+      'include_html': includeHtml ? '1' : '0',
+      if (lang != null) 'lang': _langParam(lang),
+    };
+
+    final uri = _u('characters/$id', q);
+    final raw = await _getJson(uri);
+
+    if (raw is Map<String, dynamic>) {
+      if (raw.containsKey('items')) {
+        final items = _extractItems(raw);
+        if (items.isEmpty) throw Exception('No item in response');
+        return GwcCharacter.fromJson(items.first);
+      }
+      return GwcCharacter.fromJson(raw);
+    }
+
+    if (raw is Map) {
+      final map = raw.cast<String, dynamic>();
+      if (map.containsKey('items')) {
+        final items = _extractItems(map);
+        if (items.isEmpty) throw Exception('No item in response');
+        return GwcCharacter.fromJson(items.first);
+      }
+      return GwcCharacter.fromJson(map);
+    }
+
+    throw Exception('Unexpected JSON shape: ${raw.runtimeType}');
+  }
+}
+
+/// =============================================================
+/// ✅ in-memory cache entry（超軽量）
+/// =============================================================
+class _CacheEntry {
+  final dynamic data;
+  final DateTime expiresAt;
+  _CacheEntry(this.data, this.expiresAt);
 }

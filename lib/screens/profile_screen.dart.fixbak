@@ -33,19 +33,19 @@ class ProfileScreen extends StatelessWidget {
                     value: ThemeMode.system,
                     groupValue: mode,
                     title: const Text('System'),
-                    onChanged: (v) => _applyThemeMode(v),
+                    onChanged: (v) => ThemeStore.setMode(v!),
                   ),
                   RadioListTile<ThemeMode>(
                     value: ThemeMode.light,
                     groupValue: mode,
                     title: const Text('Light'),
-                    onChanged: (v) => _applyThemeMode(v),
+                    onChanged: (v) => ThemeStore.setMode(v!),
                   ),
                   RadioListTile<ThemeMode>(
                     value: ThemeMode.dark,
                     groupValue: mode,
                     title: const Text('Dark'),
-                    onChanged: (v) => _applyThemeMode(v),
+                    onChanged: (v) => ThemeStore.setMode(v!),
                   ),
                 ],
               );
@@ -64,16 +64,5 @@ class ProfileScreen extends StatelessWidget {
         ],
       ),
     );
-  }
-
-  void _applyThemeMode(ThemeMode? v) {
-    final m = v ?? ThemeMode.system;
-    if (m == ThemeMode.system) {
-      ThemeStore.setSystem();
-    } else if (m == ThemeMode.dark) {
-      ThemeStore.setDark(true);
-    } else {
-      ThemeStore.setDark(false);
-    }
   }
 }

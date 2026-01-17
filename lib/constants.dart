@@ -1,12 +1,70 @@
 // lib/constants.dart
+//
+// ✅ このファイルの役割（超重要）
+// ------------------------------------------------------------
+// アプリ全体で共通に使う「固定値（定数）・設定」を1か所に集約する。
+// - URL（ドメイン / WP標準REST / 自作REST）
+// - プラグインのエンドポイント
+// - アプリ内言語（EN/JP）
+// ------------------------------------------------------------
+//
+// ✅ なぜここに集める？
+// - URLが散らばると「直し忘れ」で100%事故る
+// - 画面からもAPI層からも同じ値を参照できる
+// - 将来 Tekken8 追加しても、言語・URLの管理が崩れない
+//
+// ✅ これは標準ファイル？
+// - Flutter標準ではない（自分で作る設計ファイル）
+// - でもアプリが増えるほど “常設” が正解
+//
 
-/// WordPress REST API のベースURL
-/// 例: https://gamewidth.net/wp-json/wp/v2/posts
-///   この後ろに /posts や /comments を付けて使う
-const String wpBaseUrl = 'https://gamewidth.net/wp-json/wp/v2';
+// ============================================================
+// ✅ 1) サイトのドメイン（ここを変えれば全部追従させる）
+// ============================================================
+const String siteBaseUrl = 'https://gamewidth.net';
 
-/// スクロールバナー用 REST API の URL
-/// Scroll Banner プラグインで定義したエンドポイント:
-///   /wp-json/scroll-banner/v1/info
-const String scrollBannerApiUrl =
-    'https://gamewidth.net/wp-json/scroll-banner/v1/info';
+// ============================================================
+// ✅ 2) WordPress「標準」REST API（投稿/カテゴリ/コメントなど）
+// ------------------------------------------------------------
+// 例：
+// - 投稿:     $wpV2BaseUrl/posts
+// - コメント: $wpV2BaseUrl/comments
+// - カテゴリ: $wpV2BaseUrl/categories
+// ============================================================
+const String wpV2BaseUrl = '$siteBaseUrl/wp-json/wp/v2';
+
+// ============================================================
+// ✅ 3) あなたの「自作」REST API（GWC）
+// ------------------------------------------------------------
+// 例：
+// - キャラ一覧:  $gwcV1BaseUrl/characters
+// - いいね:      $gwcV1BaseUrl/like
+//
+// ⚠️ 注意：wpV2BaseUrl と混ぜない。
+// 「標準」と「自作」を分離すると、URLミスが激減する。
+// ============================================================
+const String gwcV1BaseUrl = '$siteBaseUrl/wp-json/gwc/v1';
+
+// ============================================================
+// ✅ 4) Scroll Banner（プラグイン）
+// ------------------------------------------------------------
+// wpV2BaseUrl とは別系統なのでフルURLを持つ or siteBaseUrlから組む
+// ============================================================
+const String scrollBannerApiUrl = '$siteBaseUrl/wp-json/scroll-banner/v1/info';
+
+// ============================================================
+// ✅ 5) アプリ内言語（EN / JP）
+// ------------------------------------------------------------
+// - UIの言語タブの状態
+// - APIの ?lang= を切り替える
+// - Posts/Characters/Tekken すべて同じ仕組みで使い回す
+// ============================================================
+enum AppLang { en, ja }
+
+extension AppLangX on AppLang {
+  /// APIクエリに使う値（?lang=en / ?lang=ja）
+  String get code => (this == AppLang.en) ? 'en' : 'ja';
+
+  /// UI表示用
+  String get label => (this == AppLang.en) ? 'EN' : 'JP';
+}

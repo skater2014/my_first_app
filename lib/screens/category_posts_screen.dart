@@ -42,57 +42,86 @@ class CategoriesScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Categories')),
-      body: GridView.count(
-        padding: const EdgeInsets.all(12),
-        crossAxisCount: 2,
-        crossAxisSpacing: 12,
-        mainAxisSpacing: 12,
-        childAspectRatio: 3 / 2,
-        children: [
-          for (final cat in gwcCategories)
-            InkWell(
-              borderRadius: BorderRadius.circular(16),
-              onTap: () {
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) =>
-                        CategoryPostsScreen(slug: cat.slug, title: cat.nameJa),
-                  ),
-                );
-              },
-              child: Card(
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(cat.icon, size: 28),
-                      const SizedBox(height: 8),
-                      Text(
-                        cat.nameJa,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontWeight: FontWeight.bold),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        cat.slug,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: Colors.grey,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final w = constraints.maxWidth;
+
+          // ✅ 幅が狭いなら 1列、普通は 2列（必要なら 3列も追加できる）
+          final crossAxisCount = w < 360 ? 1 : 2;
+
+          // ✅ カードの高さを「比率」じゃなくて「固定高寄り」で安定させる
+          //   1列の時は少し低め、2列の時は少し高め
+          final mainAxisExtent = crossAxisCount == 1 ? 120.0 : 150.0;
+
+          // ✅ 幅が狭いとき文字が溢れやすいので少し小さめに
+          final titleFontSize = w < 360 ? 15.0 : 16.0;
+
+          return GridView.builder(
+            padding: const EdgeInsets.all(12),
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: crossAxisCount,
+              crossAxisSpacing: 12,
+              mainAxisSpacing: 12,
+              mainAxisExtent: mainAxisExtent,
             ),
-        ],
+            itemCount: gwcCategories.length,
+            itemBuilder: (context, index) {
+              final cat = gwcCategories[index];
+              return InkWell(
+                borderRadius: BorderRadius.circular(16),
+                onTap: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => CategoryPostsScreen(
+                        slug: cat.slug,
+                        title: cat.nameJa,
+                      ),
+                    ),
+                  );
+                },
+                child: Card(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(cat.icon, size: 28),
+                        const SizedBox(height: 8),
+
+                        // ✅ タイトル（最大2行）
+                        Text(
+                          cat.nameJa,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: titleFontSize,
+                            height: 1.15,
+                          ),
+                        ),
+
+                        const Spacer(), // ✅ 下のslugを最下部に寄せて overflowしにくくする
+                        // ✅ slug（1行）
+                        Text(
+                          cat.slug,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Colors.grey,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        },
       ),
     );
   }
@@ -169,6 +198,11 @@ class _CategoryPostsScreenState extends State<CategoryPostsScreen> {
   Widget build(BuildContext context) {
     final title = widget.title ?? widget.slug;
 
+    // ✅ 画像がデカすぎる警告（Highlight Oversized Images）対策：必要なサイズに縮めてキャッシュ
+    final dpr = MediaQuery.of(context).devicePixelRatio;
+    final thumbCacheW = (110 * dpr).round();
+    final thumbCacheH = (80 * dpr).round();
+
     return Scaffold(
       appBar: AppBar(title: Text(title)),
       body: RefreshIndicator(
@@ -222,8 +256,15 @@ class _CategoryPostsScreenState extends State<CategoryPostsScreen> {
                               child: CachedNetworkImage(
                                 imageUrl: thumbUrl,
                                 fit: BoxFit.cover,
+
+                                // ✅ ここが「画像デカすぎ」対策の本丸
+                                memCacheWidth: thumbCacheW,
+                                memCacheHeight: thumbCacheH,
+
                                 placeholder: (_, __) => const Center(
-                                  child: CircularProgressIndicator(),
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
                                 ),
                                 errorWidget: (_, __, ___) => const Center(
                                   child: Icon(Icons.broken_image),

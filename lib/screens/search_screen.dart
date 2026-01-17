@@ -1,34 +1,43 @@
+import 'package:flutter/material.dart';
+
 // lib/screens/search_screen.dart
 //
-// Explore / Search Screen
-// - Explore（検索が空）: 動画だけを3カラムで流して“発見”を作る
-// - Search（検索あり） : 画像 + 動画 を混在表示（必要ならチップで Video のみ）
+// ✅ Search = 検索ハブ（司令塔UI）
 //
-// 重要な設計:
-// 1) YouTube Player を大量生成すると重い → 画面内で「見えてる上位2つ」だけ再生
-// 2) Search の “All / Video” 切替は、サーバ検索結果に対してクライアント側でフィルタ
-// 3) 古い検索が後から返ってきて上書きしないように token でガード
+// 役割：
+// 1) SearchField（検索文字）管理
+// 2) モード切替（Posts / Genshin / Tekken）管理
+// 3) 言語切替（EN / JP）管理
+// 4) モードに応じて叩くAPIを決める
+// 5) Posts：YouTube 自動再生・停止（音漏れ防止）
+//    - ✅ iOS/Androidのみ：グリッド内自動再生（mute）
+//    - ✅ Web / Desktop は重い＆不安定なので：サムネのみ（自動再生しない）
+//    - ✅ youtube_player_flutter を画面で直接使わない（GwYoutubePlayerに統一）
+// 6) Genshin：ページング + 重複排除
 //
-// UI:
-// - 上: SearchField
-// - その下: FilterChip（All / Video） ※検索中のみ表示
-// - 下: 3カラム Grid
-//
-// アイコン規則（日本語なし）:
-// - video: play_arrow（停止中） / volume_off（自動再生中=ミュート）
-// - image/article: image_outlined
+// ✅ 注意：Rowは幅オーバーしやすい → Wrapで改行させる（Right overflow対策）
+// ✅ 注意：Genshinはサーバが同キャラ別記事を複数返すことがある → charName優先で1つにまとめる
 
 import 'dart:async';
+import 'package:flutter/foundation.dart'
+    show kIsWeb, kDebugMode, setEquals, defaultTargetPlatform, TargetPlatform;
 
-import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:visibility_detector/visibility_detector.dart';
-import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 
-import '../service/wp_api_service.dart';
+// ✅ YouTube（共通Widget）
+import '../widgets/gw_youtube_player.dart';
+
+// ✅ YouTube util（ID抽出 / thumb）
+import '../utils/gw_youtube.dart';
+
+import '../constants.dart'; // ✅ AppLang / wpBaseUrl
+import '../service/wp_api_service.dart'; // ✅ WpApiService と GwcApi
 import '../model/post.dart';
+import '../model/gwc_character.dart';
+
 import 'post_detail_screen.dart';
+import 'character_detail_screen.dart';
 
 class SearchScreen extends StatefulWidget {
   const SearchScreen({super.key});
@@ -37,66 +46,175 @@ class SearchScreen extends StatefulWidget {
   State<SearchScreen> createState() => _SearchScreenState();
 }
 
-class _SearchScreenState extends State<SearchScreen> {
-  // ---- API
-  final _api = WpApiService();
+enum _SearchMode { posts, genshin, tekken }
 
-  // ---- Search UI
+class _SearchScreenState extends State<SearchScreen> {
+  // ==========================================================
+  // ✅ API（通信）
+  // ==========================================================
+  final _postApi = WpApiService();
+  late final GwcApi _gwcApi;
+
+  // ==========================================================
+  // ✅ Search UI（共通）
+  // ==========================================================
   final _textController = TextEditingController();
   final _searchDebouncer = _Debouncer(const Duration(milliseconds: 350));
-
-  // visibleFraction は細かく動くので、active再計算も少し待つ
   final _activeDebouncer = _Debouncer(const Duration(milliseconds: 250));
 
   bool _loading = false;
   String? _error;
   String _query = '';
 
-  // ✅ Search中だけ有効：Video のみに絞るか
-  //    - All: 画像 + 動画
-  //    - Video: 動画だけ
-  bool _videoOnlyInSearch = false;
+  _SearchMode _mode = _SearchMode.posts;
 
-  // ✅ 表示する投稿（Allなら画像も動画も混在）
+  // ==========================================================
+  // ✅ 言語切替（Posts / Genshin を別々に持つ）
+  // ==========================================================
+  AppLang _postsLang = AppLang.en;
+  AppLang _genshinLang = AppLang.en;
+
+  AppLang _langForCurrentMode() {
+    if (_mode == _SearchMode.posts) return _postsLang;
+    if (_mode == _SearchMode.genshin) return _genshinLang;
+    return AppLang.en;
+  }
+
+  void _setLangForCurrentMode(AppLang next) {
+    if (next == _langForCurrentMode()) return;
+
+    // ✅ 言語切替の瞬間は動画停止（音漏れ防止）
+    _stopAllVideosNoSetState();
+
+    setState(() {
+      if (_mode == _SearchMode.posts) _postsLang = next;
+      if (_mode == _SearchMode.genshin) _genshinLang = next;
+    });
+
+    // ✅ 同じ検索文字で再検索
+    _searchByMode(_textController.text);
+  }
+
+  // ==========================================================
+  // ✅ Posts
+  // ==========================================================
+  bool _videoOnlyInSearch = false;
   List<Post> _items = [];
 
-  // ---- “見えてる割合” 管理
-  // postId -> visibleFraction
-  final Map<int, double> _visible = {};
+  bool get _enableGridAutoplay {
+    if (kIsWeb) return false; // ✅ Webはサムネのみ（軽量）
+    final tp = defaultTargetPlatform;
+    return tp == TargetPlatform.android || tp == TargetPlatform.iOS;
+  }
 
-  // ---- 自動再生するpostId（最大2）
+  final Map<int, double> _visible = {}; // postId -> visibleFraction
   Set<int> _activeIds = <int>{};
 
-  // ---- activeだけcontrollerを持つ（最大2）
-  final Map<int, YoutubePlayerController> _controllers = {};
+  // ==========================================================
+  // ✅ Genshin（ページング）
+  // ==========================================================
+  final List<GwcCharacter> _chars = [];
+  final Set<int> _charIds = <int>{};
 
-  // ✅ 古い検索結果が後から帰ってきて上書きしないためのトークン
+  // ✅ 重複排除キー（同キャラ別記事対策：charName最優先）
+  final Set<String> _charKeys = <String>{};
+
+  final ScrollController _charScroll = ScrollController();
+
+  int _charPage = 1;
+  final int _charPerPage = 20;
+  bool _charHasMore = true;
+  bool _charLoadingMore = false;
+
+  // ✅ 古い検索結果で上書きしないためのトークン
   int _searchToken = 0;
 
   @override
   void initState() {
     super.initState();
+
+    _gwcApi = GwcApi();
+
+    // ✅ 初期：Posts Explore（検索空＝動画だけ）
     _loadExplore();
+
+    // ✅ Genshinの無限スクロール
+    _charScroll.addListener(() {
+      if (_mode != _SearchMode.genshin) return;
+      if (_loading) return;
+      if (_charLoadingMore) return;
+      if (!_charHasMore) return;
+      if (!_charScroll.hasClients) return;
+
+      final pos = _charScroll.position;
+
+      // ✅ リストが短くてスクロールできない時（max=0）は絶対に loadMore しない
+      if (pos.maxScrollExtent <= 0) return;
+
+      const threshold = 300.0;
+      final reachedBottom = pos.pixels >= (pos.maxScrollExtent - threshold);
+      if (!reachedBottom) return;
+
+      _loadCharactersMore();
+    });
   }
 
   @override
   void dispose() {
+    _stopAllVideosNoSetState();
+
     _textController.dispose();
     _searchDebouncer.dispose();
     _activeDebouncer.dispose();
-
-    for (final c in _controllers.values) {
-      c.dispose();
-    }
-    _controllers.clear();
+    _charScroll.dispose();
 
     super.dispose();
   }
 
-  // ----------------------------------------------------------------------
-  // Explore（検索が空のとき）
-  // - “発見”用途なので動画だけにして軽くする
-  // ----------------------------------------------------------------------
+  // ==========================================================
+  // ✅ 動画停止（disposeでも安全）
+  // - controller を画面で持たないので、activeIds を空にするだけで止まる
+  // ==========================================================
+  void _stopAllVideosNoSetState() {
+    _visible.clear();
+    _activeIds = <int>{};
+  }
+
+  // ==========================================================
+  // ✅ モード切替
+  // ==========================================================
+  void _setMode(_SearchMode next) {
+    if (next == _mode) return;
+
+    _stopAllVideosNoSetState();
+
+    setState(() {
+      _mode = next;
+      if (_mode != _SearchMode.posts) _videoOnlyInSearch = false;
+    });
+
+    _searchByMode(_textController.text);
+  }
+
+  // ==========================================================
+  // ✅ 入力変化
+  // ==========================================================
+  void _onChange(String text) {
+    setState(() {});
+    _searchDebouncer.run(() => _searchByMode(text));
+  }
+
+  Future<void> _searchByMode(String q) async {
+    if (_mode == _SearchMode.posts) return _searchPosts(q);
+    if (_mode == _SearchMode.genshin) return _searchGenshin(q);
+    return _searchTekken(q);
+  }
+
+  Future<void> _onRefresh() async => _searchByMode(_query);
+
+  // ==========================================================
+  // ✅ Posts：Explore（検索空）＝動画だけ
+  // ==========================================================
   Future<void> _loadExplore() async {
     final token = ++_searchToken;
 
@@ -104,18 +222,13 @@ class _SearchScreenState extends State<SearchScreen> {
       _loading = true;
       _error = null;
       _query = '';
-      // Exploreではチップは出さないので、状態は残してもOKだが
-      // UXを安定させたいならここで false に戻してもよい
-      // _videoOnlyInSearch = false;
     });
 
     try {
-      final posts = await _api.fetchAllPosts(perPage: 80);
+      final posts = await _postApi.fetchAllPosts(perPage: 40, lang: _postsLang);
       if (!mounted || token != _searchToken) return;
 
-      // ✅ Exploreは動画だけ
       final videos = posts.where((p) => _youtubeIdOf(p) != null).toList();
-
       setState(() => _items = videos);
       _resetActiveState();
     } catch (e) {
@@ -127,19 +240,14 @@ class _SearchScreenState extends State<SearchScreen> {
     }
   }
 
-  // ----------------------------------------------------------------------
-  // Search（検索キーワードあり）
-  // - まずサーバ検索結果を全部もらう（画像+動画混在）
-  // - チップが Video のときだけ “動画のみ” に絞る（クライアント側フィルタ）
-  // ----------------------------------------------------------------------
-  Future<void> _search(String q) async {
+  // ==========================================================
+  // ✅ Posts：Search（検索あり）
+  // ==========================================================
+  Future<void> _searchPosts(String q) async {
     final trimmed = q.trim();
     final token = ++_searchToken;
 
-    if (trimmed.isEmpty) {
-      await _loadExplore();
-      return;
-    }
+    if (trimmed.isEmpty) return _loadExplore();
 
     setState(() {
       _loading = true;
@@ -148,16 +256,14 @@ class _SearchScreenState extends State<SearchScreen> {
     });
 
     try {
-      // ✅ ここが「検索クエリ」：
-      // WpApiService.searchAllPosts() が
-      // /posts?search=..., /gu?search=..., /gu-jp?search=...
-      // を叩いて結果をまとめて返す。
-      final results = await _api.searchAllPosts(query: trimmed, perPage: 80);
+      final results = await _postApi.searchAllPosts(
+        query: trimmed,
+        perPage: 40,
+        lang: _postsLang,
+      );
+
       if (!mounted || token != _searchToken) return;
 
-      // ✅ “tekken は出ない / genshin は出る” みたいな差は、
-      // このフィルタが ON のときに起きる。
-      // Video のときは youtubeId が無い投稿（画像記事など）は落ちる。
       final items = _videoOnlyInSearch
           ? results.where((p) => _youtubeIdOf(p) != null).toList()
           : results;
@@ -173,27 +279,215 @@ class _SearchScreenState extends State<SearchScreen> {
     }
   }
 
-  void _onChange(String text) {
-    setState(() {}); // clearボタンなど更新
-    _searchDebouncer.run(() => _search(text));
+  // ==========================================================
+  // ✅ Genshin：重複排除キー
+  // ==========================================================
+  String _charKeyOf(GwcCharacter c) {
+    final primary = c.charName.trim();
+    if (primary.isNotEmpty) return primary.toLowerCase();
+
+    final key =
+        (c.permalink.isNotEmpty
+                ? c.permalink
+                : (c.slug.isNotEmpty ? c.slug : c.title))
+            .trim()
+            .toLowerCase();
+
+    return key;
   }
 
-  Future<void> _onRefresh() async {
-    if (_query.isEmpty) {
-      await _loadExplore();
-    } else {
-      await _search(_query);
+  int _addCharactersUnique(List<GwcCharacter> list) {
+    var added = 0;
+
+    for (final ch in list) {
+      final key = _charKeyOf(ch);
+
+      final okByKey = key.isEmpty ? true : _charKeys.add(key);
+      final okById = _charIds.add(ch.id);
+
+      if (!okByKey || !okById) continue;
+
+      _chars.add(ch);
+      added++;
+    }
+
+    return added;
+  }
+
+  // ==========================================================
+  // ✅ Genshin：検索（空なら一覧）
+  // ==========================================================
+  Future<void> _searchGenshin(String q) async {
+    final trimmed = q.trim();
+    final token = ++_searchToken;
+
+    _stopAllVideosNoSetState();
+
+    setState(() {
+      _loading = true;
+      _error = null;
+      _query = trimmed;
+    });
+
+    try {
+      _chars.clear();
+      _charIds.clear();
+      _charKeys.clear();
+      _charPage = 1;
+      _charHasMore = true;
+      _charLoadingMore = false;
+
+      final list = await _gwcApi.fetchCharacters(
+        page: _charPage,
+        perPage: _charPerPage,
+        full: false,
+        includeHtml: false,
+        search: trimmed.isEmpty ? null : trimmed,
+        lang: _genshinLang,
+      );
+
+      if (!mounted || token != _searchToken) return;
+
+      final added = _addCharactersUnique(list);
+
+      if (kDebugMode) {
+        // ignore: avoid_print
+        print(
+          '[Genshin] page=1 raw=${list.length} added=$added lang=${_genshinLang.code}',
+        );
+      }
+
+      _charHasMore = !(list.isEmpty || added == 0);
+      _charPage = 2;
+
+      if (_charScroll.hasClients) _charScroll.jumpTo(0);
+
+      setState(() {});
+    } catch (e) {
+      if (!mounted || token != _searchToken) return;
+      setState(() => _error = 'Genshin characters failed: $e');
+    } finally {
+      if (!mounted || token != _searchToken) return;
+      setState(() => _loading = false);
     }
   }
 
-  // ----------------------------------------------------------------------
-  // YouTube / Image helpers
-  // ----------------------------------------------------------------------
+  Future<void> _loadCharactersMore() async {
+    if (_loading) return;
+    if (_charLoadingMore) return;
+    if (!_charHasMore) return;
+
+    final token = _searchToken;
+
+    setState(() {
+      _loading = true;
+      _charLoadingMore = true;
+      _error = null;
+    });
+
+    try {
+      final list = await _gwcApi.fetchCharacters(
+        page: _charPage,
+        perPage: _charPerPage,
+        full: false,
+        includeHtml: false,
+        search: _query.trim().isEmpty ? null : _query.trim(),
+        lang: _genshinLang,
+      );
+
+      if (!mounted || token != _searchToken) return;
+
+      final added = _addCharactersUnique(list);
+
+      if (kDebugMode) {
+        // ignore: avoid_print
+        print(
+          '[Genshin] page=$_charPage raw=${list.length} added=$added lang=${_genshinLang.code}',
+        );
+      }
+
+      if (list.isEmpty || added == 0) {
+        _charHasMore = false;
+      } else {
+        _charPage += 1;
+      }
+
+      setState(() {});
+    } catch (e) {
+      if (!mounted || token != _searchToken) return;
+      setState(() => _error = 'Load more failed: $e');
+    } finally {
+      if (!mounted || token != _searchToken) return;
+      setState(() {
+        _loading = false;
+        _charLoadingMore = false;
+      });
+    }
+  }
+
+  // ==========================================================
+  // ✅ Tekken（将来）
+  // ==========================================================
+  Future<void> _searchTekken(String q) async {
+    _stopAllVideosNoSetState();
+    setState(() {
+      _query = q.trim();
+      _error = null;
+      _loading = false;
+    });
+  }
+
+  // ==========================================================
+  // ✅ element 表示（URL→Geoなど）
+  // ==========================================================
+  String _elementLabelFromAny(String raw) {
+    final s = raw.trim();
+    if (s.isEmpty) return '';
+
+    final m = RegExp(
+      r'Element_([A-Za-z]+)\.(png|webp|jpg)$',
+      caseSensitive: false,
+    ).firstMatch(s.split('?').first);
+    if (m != null) {
+      final name = (m.group(1) ?? '').trim();
+      if (name.isEmpty) return '';
+      return name[0].toUpperCase() + name.substring(1).toLowerCase();
+    }
+
+    if (!s.startsWith('http')) {
+      return s[0].toUpperCase() + s.substring(1).toLowerCase();
+    }
+
+    return '';
+  }
+
+  String? _elementIconUrl(String raw) {
+    final s = raw.trim();
+    if (!s.startsWith('http')) return null;
+
+    final clean = s.toLowerCase().split('?').first;
+    if (clean.endsWith('.png') ||
+        clean.endsWith('.webp') ||
+        clean.endsWith('.jpg')) {
+      return s;
+    }
+    return null;
+  }
+
+  // ==========================================================
+  // ✅ YouTube / Image helpers（Posts）
+  // ==========================================================
   String? _youtubeIdOf(Post p) {
-    // youtubeId / pageVideoId が URL の場合もあるので convertUrlToId で吸収
     final raw = (p.youtubeId ?? p.pageVideoId)?.trim();
     if (raw == null || raw.isEmpty) return null;
-    return YoutubePlayer.convertUrlToId(raw) ?? raw;
+
+    // ✅ できるだけ “11文字ID” を返す（URLも対応）
+    final id = gwExtractYoutubeId(raw);
+    if (id != null && id.isNotEmpty) return id;
+
+    // fallback：文字列中から11文字を拾う（変なURLでも拾える）
+    final m = RegExp(r'([A-Za-z0-9_-]{11})').firstMatch(raw);
+    return m?.group(1);
   }
 
   String _thumbUrl(String youtubeId) =>
@@ -202,72 +496,44 @@ class _SearchScreenState extends State<SearchScreen> {
   String? _safeImageUrl(String? url) {
     if (url == null || url.isEmpty) return null;
     final u = url.toLowerCase().split('?').first;
-    // ✅ AVIF が表示できない端末があるので回避
     if (u.endsWith('.avif')) return null;
     return url;
   }
 
-  // ----------------------------------------------------------------------
-  // Active autoplay (max 2)
-  // - “見えてる上位2つ” の動画だけプレイヤー化してミュート自動再生
-  // ----------------------------------------------------------------------
+  // ==========================================================
+  // ✅ Active autoplay（Posts）
+  // - 画面で controller を持たない
+  // - activeIds に入っているセルだけ GwYoutubePlayer(autoPlay/mute) を出す
+  // ==========================================================
   void _resetActiveState() {
     _visible.clear();
     _setActiveIds(<int>{});
   }
 
-  YoutubePlayerController _createController(String youtubeId) {
-    return YoutubePlayerController(
-      initialVideoId: youtubeId,
-      flags: const YoutubePlayerFlags(
-        autoPlay: true,
-        mute: true, // ✅ 基本はここでミュート
-        hideControls: true,
-        controlsVisibleAtStart: false,
-        disableDragSeek: true,
-        enableCaption: false,
-      ),
-    );
-  }
-
   void _setActiveIds(Set<int> next) {
-    if (setEquals(next, _activeIds)) return;
+    // ✅ autoplay無効環境では常に空
+    if (!_enableGridAutoplay) {
+      if (_activeIds.isNotEmpty) {
+        _activeIds = <int>{};
+        if (mounted) setState(() {});
+      }
+      return;
+    }
 
-    final prev = _activeIds;
+    if (setEquals(next, _activeIds)) return;
     _activeIds = next;
 
-    // 1) 外れたものは停止して破棄（controller増殖防止）
-    for (final id in prev.difference(next)) {
-      final c = _controllers.remove(id);
-      c?.pause();
-      c?.dispose();
-    }
-
-    // 2) 入ったものは生成（最大2）
-    for (final id in next.difference(prev)) {
-      final idx = _items.indexWhere((p) => p.id == id);
-      if (idx == -1) continue;
-
-      final yt = _youtubeIdOf(_items[idx]);
-      if (yt == null) continue;
-
-      _controllers[id] = _createController(yt);
-    }
-
-    // 3) 念押しで mute + volume=0（端末によって mute が甘い事故対策）
-    for (final id in next) {
-      final c = _controllers[id];
-      c?.mute();
-      c?.setVolume(0);
-      c?.play();
-    }
-
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
   void _recomputeActive() {
-    const minVisible = 0.60; // 60%以上見えているセルだけ候補
-    const maxActive = 2;
+    if (_mode != _SearchMode.posts) return;
+    if (!_enableGridAutoplay) return;
+
+    final minVisible = kIsWeb ? 0.75 : 0.60;
+
+    // ★ここ
+    final maxActive = kIsWeb ? 1 : 3;
 
     if (_items.isEmpty) {
       _setActiveIds(<int>{});
@@ -279,24 +545,23 @@ class _SearchScreenState extends State<SearchScreen> {
     for (final entry in _visible.entries) {
       final id = entry.key;
       final fraction = entry.value;
-
       if (fraction < minVisible) continue;
 
       final idx = _items.indexWhere((p) => p.id == id);
       if (idx == -1) continue;
-
-      // ✅ “動画だけ” が自動再生対象（画像は対象外）
       if (_youtubeIdOf(_items[idx]) == null) continue;
 
       candidates.add(id);
     }
 
-    // 見えてる割合が高い順にして上位2つ
     candidates.sort((a, b) => (_visible[b] ?? 0).compareTo(_visible[a] ?? 0));
     _setActiveIds(candidates.take(maxActive).toSet());
   }
 
   void _onVisibility(int postId, double fraction) {
+    if (_mode != _SearchMode.posts) return;
+    if (!_enableGridAutoplay) return;
+
     if (fraction <= 0) {
       _visible.remove(postId);
     } else {
@@ -305,12 +570,13 @@ class _SearchScreenState extends State<SearchScreen> {
     _activeDebouncer.run(_recomputeActive);
   }
 
-  // ----------------------------------------------------------------------
-  // UI
-  // ----------------------------------------------------------------------
+  // ==========================================================
+  // ✅ UI
+  // ==========================================================
   @override
   Widget build(BuildContext context) {
     final title = _query.isEmpty ? 'Explore' : 'Search';
+    final currentLang = _langForCurrentMode();
 
     return Scaffold(
       appBar: AppBar(
@@ -323,17 +589,17 @@ class _SearchScreenState extends State<SearchScreen> {
       body: SafeArea(
         child: Column(
           children: [
-            // ---- Search Field
+            // ===== Search box =====
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
               child: TextField(
                 controller: _textController,
                 onChanged: _onChange,
-                onSubmitted: (v) => _search(v),
+                onSubmitted: (v) => _searchByMode(v),
                 textInputAction: TextInputAction.search,
                 decoration: InputDecoration(
                   prefixIcon: const Icon(Icons.search),
-                  hintText: 'Search (empty = Explore)',
+                  hintText: 'Search (mode: Posts / Genshin / Tekken)',
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -345,18 +611,73 @@ class _SearchScreenState extends State<SearchScreen> {
                           onPressed: () {
                             _textController.clear();
                             setState(() {});
-                            _loadExplore();
+                            _searchByMode('');
                           },
                         ),
                 ),
               ),
             ),
 
-            // ---- FilterChip (Search中のみ表示)
-            if (_query.isNotEmpty)
+            // ✅ Mode chips（Rowだと溢れる → Wrap）
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  _modeChip(
+                    selected: _mode == _SearchMode.posts,
+                    icon: Icons.article_outlined,
+                    label: 'Posts',
+                    onTap: () => _setMode(_SearchMode.posts),
+                  ),
+                  _modeChip(
+                    selected: _mode == _SearchMode.genshin,
+                    icon: Icons.people_alt_outlined,
+                    label: 'Genshin',
+                    onTap: () => _setMode(_SearchMode.genshin),
+                  ),
+                  _modeChip(
+                    selected: _mode == _SearchMode.tekken,
+                    icon: Icons.sports_mma_outlined,
+                    label: 'Tekken',
+                    onTap: () => _setMode(_SearchMode.tekken),
+                  ),
+                ],
+              ),
+            ),
+
+            // ✅ Language chips（Rowだと溢れる → Wrap）
+            if (_mode != _SearchMode.tekken)
               Padding(
                 padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                child: Row(
+                child: Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    _modeChip(
+                      selected: currentLang == AppLang.en,
+                      icon: Icons.language,
+                      label: 'EN',
+                      onTap: () => _setLangForCurrentMode(AppLang.en),
+                    ),
+                    _modeChip(
+                      selected: currentLang == AppLang.ja,
+                      icon: Icons.translate,
+                      label: 'JP',
+                      onTap: () => _setLangForCurrentMode(AppLang.ja),
+                    ),
+                  ],
+                ),
+              ),
+
+            // Postsだけ：All/Video（検索あり時）
+            if (_mode == _SearchMode.posts && _query.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                child: Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
                   children: [
                     _modeChip(
                       selected: !_videoOnlyInSearch,
@@ -364,30 +685,30 @@ class _SearchScreenState extends State<SearchScreen> {
                       label: 'All',
                       onTap: () {
                         if (!_videoOnlyInSearch) return;
+                        _stopAllVideosNoSetState();
                         setState(() => _videoOnlyInSearch = false);
-                        _search(_query); // 切替したら再検索（同じクエリ）
+                        _searchPosts(_query);
                       },
                     ),
-                    const SizedBox(width: 10),
                     _modeChip(
                       selected: _videoOnlyInSearch,
                       icon: Icons.movie_filter_rounded,
                       label: 'Video',
                       onTap: () {
                         if (_videoOnlyInSearch) return;
+                        _stopAllVideosNoSetState();
                         setState(() => _videoOnlyInSearch = true);
-                        _search(_query);
+                        _searchPosts(_query);
                       },
                     ),
                   ],
                 ),
               ),
 
-            // ---- Body
             Expanded(
               child: RefreshIndicator(
                 onRefresh: _onRefresh,
-                child: _buildBody(),
+                child: _buildBodyByMode(),
               ),
             ),
           ],
@@ -396,7 +717,6 @@ class _SearchScreenState extends State<SearchScreen> {
     );
   }
 
-  // FilterChip の見た目（あなたが見せたイメージに近い “わかりやすい2択”）
   Widget _modeChip({
     required bool selected,
     required IconData icon,
@@ -414,7 +734,16 @@ class _SearchScreenState extends State<SearchScreen> {
     );
   }
 
-  Widget _buildBody() {
+  Widget _buildBodyByMode() {
+    if (_mode == _SearchMode.posts) return _buildPostsBody();
+    if (_mode == _SearchMode.genshin) return _buildGenshinBody();
+    return _buildTekkenBody();
+  }
+
+  // ==========================================================
+  // ✅ Posts Body（グリッド）
+  // ==========================================================
+  Widget _buildPostsBody() {
     if (_loading && _items.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -459,91 +788,91 @@ class _SearchScreenState extends State<SearchScreen> {
           itemCount: _items.length,
           itemBuilder: (context, index) {
             final post = _items[index];
-
-            // yt == null なら「画像記事（or 動画ID無し）」
             final yt = _youtubeIdOf(post);
 
-            // active は “動画” かつ “activeIdsに入ってる” ときだけ
-            final active = yt != null && _activeIds.contains(post.id);
-            final controller = _controllers[post.id];
+            final active =
+                _enableGridAutoplay &&
+                yt != null &&
+                _activeIds.contains(post.id);
+
+            final cell = InkWell(
+              onTap: () {
+                _stopAllVideosNoSetState();
+                if (mounted) setState(() {});
+
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => PostDetailScreen(post: post),
+                  ),
+                );
+              },
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (yt != null) ...[
+                    // ✅ iOS/Androidのみ：自動再生（mute）
+                    if (active)
+                      IgnorePointer(
+                        ignoring: true,
+                        child: GwYoutubePlayer(
+                          key: ValueKey('yt:${post.id}'),
+                          videoId: yt,
+                          autoPlay: true,
+                          mute: true,
+                          useCard: false,
+                          useAspectRatio: false, // グリッドの正方形に合わせる
+                        ),
+                      )
+                    else
+                      CachedNetworkImage(
+                        imageUrl: _thumbUrl(yt),
+                        fit: BoxFit.cover,
+                        placeholder: (_, __) =>
+                            Container(color: Colors.black12),
+                        errorWidget: (_, __, ___) => Container(
+                          color: Colors.black12,
+                          child: const Icon(Icons.broken_image_outlined),
+                        ),
+                      ),
+                  ] else ...[
+                    _buildImageCell(post),
+                  ],
+                  Positioned(
+                    top: 6,
+                    right: 6,
+                    child: Container(
+                      padding: const EdgeInsets.all(6),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.35),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Icon(
+                        yt != null
+                            ? (_enableGridAutoplay && active
+                                  ? Icons.volume_off
+                                  : Icons.play_arrow)
+                            : Icons.image_outlined,
+                        size: 16,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            );
+
+            if (yt == null || !_enableGridAutoplay) return cell;
 
             return VisibilityDetector(
               key: Key('cell:${post.id}'),
               onVisibilityChanged: (info) =>
                   _onVisibility(post.id, info.visibleFraction),
-              child: InkWell(
-                onTap: () {
-                  // ✅ 詳細に行く前に止める（音漏れ/暴走防止）
-                  _setActiveIds(<int>{});
-
-                  // 詳細画面で「普通に再生/閲覧」
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => PostDetailScreen(post: post),
-                    ),
-                  );
-                },
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    if (yt != null) ...[
-                      // -----------------------
-                      // VIDEO CELL
-                      // -----------------------
-                      if (active && controller != null)
-                        IgnorePointer(
-                          ignoring: true, // グリッド上では操作不可（軽量）
-                          child: YoutubePlayer(
-                            controller: controller,
-                            aspectRatio: 1.0,
-                          ),
-                        )
-                      else
-                        CachedNetworkImage(
-                          imageUrl: _thumbUrl(yt),
-                          fit: BoxFit.cover,
-                          placeholder: (_, __) =>
-                              Container(color: Colors.black12),
-                          errorWidget: (_, __, ___) => Container(
-                            color: Colors.black12,
-                            child: const Icon(Icons.broken_image_outlined),
-                          ),
-                        ),
-                    ] else ...[
-                      // -----------------------
-                      // IMAGE/ARTICLE CELL
-                      // -----------------------
-                      _buildImageCell(post),
-                    ],
-
-                    // 右上マーク（言語なしで判別できるやつ）
-                    Positioned(
-                      top: 6,
-                      right: 6,
-                      child: Container(
-                        padding: const EdgeInsets.all(6),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.35),
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: Icon(
-                          yt != null
-                              ? (active ? Icons.volume_off : Icons.play_arrow)
-                              : Icons.image_outlined,
-                          size: 16,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+              child: cell,
             );
           },
         ),
 
-        // 右上ローディング（結果がある状態で更新中）
         if (_loading && _items.isNotEmpty)
           Positioned(
             top: 8,
@@ -567,7 +896,6 @@ class _SearchScreenState extends State<SearchScreen> {
 
   Widget _buildImageCell(Post post) {
     final img = _safeImageUrl(post.imageUrl);
-
     if (img == null) {
       return Container(
         color: Colors.black12,
@@ -585,9 +913,156 @@ class _SearchScreenState extends State<SearchScreen> {
       ),
     );
   }
+
+  // ==========================================================
+  // ✅ Genshin Body（ListView）
+  // ==========================================================
+  Widget _buildGenshinBody() {
+    if (_loading && _chars.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (_error != null && _chars.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          const SizedBox(height: 120),
+          Center(child: Text(_error!)),
+          const SizedBox(height: 12),
+          Center(
+            child: FilledButton(
+              onPressed: () => _searchGenshin(_query),
+              child: const Text('Retry'),
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (_chars.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: const [
+          SizedBox(height: 120),
+          Center(child: Text('No characters')),
+        ],
+      );
+    }
+
+    return ListView.builder(
+      controller: _charScroll,
+      physics: const AlwaysScrollableScrollPhysics(),
+      itemCount: _chars.length + 1,
+      itemBuilder: (context, index) {
+        if (index == _chars.length) {
+          if (_loading && _charLoadingMore) {
+            return const Padding(
+              padding: EdgeInsets.all(16),
+              child: Center(child: CircularProgressIndicator()),
+            );
+          }
+          if (!_charHasMore) {
+            return const Padding(
+              padding: EdgeInsets.all(16),
+              child: Center(child: Text('End')),
+            );
+          }
+          return const SizedBox.shrink();
+        }
+
+        final c = _chars[index];
+        final elementLabel = _elementLabelFromAny(c.element);
+        final elementIcon = _elementIconUrl(c.element);
+
+        return ListTile(
+          leading: _portrait(c.portrait),
+          title: Text(c.charName.isNotEmpty ? c.charName : c.title),
+          subtitle: Wrap(
+            spacing: 8,
+            runSpacing: 2,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              if (elementIcon != null)
+                CachedNetworkImage(
+                  imageUrl: elementIcon,
+                  width: 16,
+                  height: 16,
+                  fit: BoxFit.contain,
+                  errorWidget: (_, __, ___) =>
+                      const SizedBox(width: 16, height: 16),
+                ),
+              if (elementLabel.isNotEmpty) Text(elementLabel),
+              if (c.weaponType.isNotEmpty) Text(c.weaponType),
+              if (c.rarity.isNotEmpty) Text('★${c.rarity}'),
+              if (c.role.isNotEmpty) Text(c.role),
+            ],
+          ),
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => CharacterDetailScreen(
+                  characterId: c.id,
+                  lang: _genshinLang,
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _portrait(String url) {
+    const size = 44.0;
+
+    if (url.trim().isEmpty) {
+      return Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(
+          color: Colors.black12,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: const Icon(Icons.person),
+      );
+    }
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: CachedNetworkImage(
+        imageUrl: url,
+        width: size,
+        height: size,
+        fit: BoxFit.cover,
+        placeholder: (_, __) => Container(color: Colors.black12),
+        errorWidget: (_, __, ___) => Container(
+          color: Colors.black12,
+          child: const Icon(Icons.broken_image_outlined),
+        ),
+      ),
+    );
+  }
+
+  // ==========================================================
+  // ✅ Tekken Body（将来）
+  // ==========================================================
+  Widget _buildTekkenBody() {
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      children: const [
+        SizedBox(height: 120),
+        Center(child: Text('Tekken mode: coming soon')),
+        SizedBox(height: 12),
+        Center(child: Text('ここに Tekken キャラAPI を繋げる')),
+      ],
+    );
+  }
 }
 
-// 入力を少し待ってから実行する Debouncer
+// ==========================================================
+// ✅ Debouncer（このファイルで1回だけ定義）
+// ==========================================================
 class _Debouncer {
   final Duration delay;
   Timer? _timer;

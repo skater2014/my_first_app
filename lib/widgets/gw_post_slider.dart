@@ -1,24 +1,25 @@
-// lib/widgets/gw_post_slider.dart
+import 'package:flutter/foundation.dart'
+    show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:youtube_player_flutter/youtube_player_flutter.dart';
 
 import '../model/gw_slider_item.dart';
+import '../widgets/gw_youtube_player.dart';
+import '../utils/gw_youtube.dart';
 
-/// ============================================================
-/// GwPostSlider
-/// - 記事の先頭に出す「複数メディア（画像/YouTube）スライダー」
-/// - 上：メイン表示（画像 or YouTube）
-/// - 下：サムネ横並び（タップでメイン切替）
-/// - 左右矢印で前後移動
-/// ============================================================
 class GwPostSlider extends StatefulWidget {
+  const GwPostSlider({
+    super.key,
+    required this.items,
+    this.initialIndex = 0,
+    this.autoPlayVideo = true,
+    this.mute = true,
+  });
+
   final List<GwSliderItem> items;
-
-  /// 任意：初期表示index
   final int initialIndex;
-
-  const GwPostSlider({super.key, required this.items, this.initialIndex = 0});
+  final bool autoPlayVideo;
+  final bool mute;
 
   @override
   State<GwPostSlider> createState() => _GwPostSliderState();
@@ -27,122 +28,94 @@ class GwPostSlider extends StatefulWidget {
 class _GwPostSliderState extends State<GwPostSlider> {
   late int _index;
 
-  YoutubePlayerController? _yt;
+  static const double _ratio = 16 / 9;
+  static const double _thumbH = 74;
+  static const double _thumbW = 118;
+
+  bool get _canPlayYoutube {
+    if (kIsWeb) return true;
+    return defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.android;
+    // ✅ macOS/Windows/Linux は false（153回避）
+  }
 
   @override
   void initState() {
     super.initState();
-
-    _index = widget.items.isEmpty
-        ? 0
-        : widget.initialIndex.clamp(0, widget.items.length - 1);
-
-    // 初期がyoutubeならコントローラ準備
-    _ensureYoutubeControllerIfNeeded(
-      widget.items.isNotEmpty ? widget.items[_index] : null,
-    );
+    _index = _clampIndex(widget.initialIndex, widget.items.length);
   }
 
   @override
   void didUpdateWidget(covariant GwPostSlider oldWidget) {
     super.didUpdateWidget(oldWidget);
-
-    // itemsが差し替わった時の安全策
-    if (widget.items.isEmpty) {
-      _index = 0;
-      _yt?.dispose();
-      _yt = null;
-      return;
-    }
-    if (_index >= widget.items.length) {
-      setState(() => _index = widget.items.length - 1);
-      _ensureYoutubeControllerIfNeeded(widget.items[_index]);
-    }
+    _index = _clampIndex(_index, widget.items.length);
   }
 
-  @override
-  void dispose() {
-    _yt?.dispose();
-    super.dispose();
+  int _clampIndex(int i, int len) {
+    if (len <= 0) return 0;
+    if (i < 0) return 0;
+    if (i >= len) return len - 1;
+    return i;
   }
 
-  /// ------------------------------------------
-  /// YouTube補助
-  /// ------------------------------------------
-  String? _videoIdFrom(String raw) {
-    final t = raw.trim();
-    if (t.isEmpty) return null;
-    return YoutubePlayer.convertUrlToId(t) ?? t; // urlでもidでもOK
-  }
-
-  String? _youtubeThumbFrom(String raw) {
-    final id = _videoIdFrom(raw);
-    if (id == null) return null;
-    return 'https://img.youtube.com/vi/$id/hqdefault.jpg';
-  }
-
-  void _ensureYoutubeControllerIfNeeded(GwSliderItem? item) {
-    if (item == null) return;
-    if (item.type != 'youtube') return;
-
-    final id = _videoIdFrom(item.src);
-    if (id == null) return;
-
-    if (_yt == null) {
-      _yt = YoutubePlayerController(
-        initialVideoId: id,
-        flags: const YoutubePlayerFlags(
-          autoPlay: false,
-          mute: false,
-          enableCaption: true,
-        ),
-      );
-    } else {
-      _yt!.load(id);
-    }
-  }
-
-  /// ------------------------------------------
-  /// 操作：前後移動
-  /// ------------------------------------------
   void _prev() {
-    if (widget.items.isEmpty) return;
-    final next = (_index - 1) < 0 ? widget.items.length - 1 : _index - 1;
-    setState(() => _index = next);
-    _ensureYoutubeControllerIfNeeded(widget.items[_index]);
+    final len = widget.items.length;
+    if (len == 0) return;
+    setState(() => _index = (_index - 1) < 0 ? len - 1 : _index - 1);
   }
 
   void _next() {
-    if (widget.items.isEmpty) return;
-    final next = (_index + 1) >= widget.items.length ? 0 : _index + 1;
-    setState(() => _index = next);
-    _ensureYoutubeControllerIfNeeded(widget.items[_index]);
+    final len = widget.items.length;
+    if (len == 0) return;
+    setState(() => _index = (_index + 1) >= len ? 0 : _index + 1);
   }
 
   void _tapThumb(int i) {
-    if (i < 0 || i >= widget.items.length) return;
-    setState(() => _index = i);
-    _ensureYoutubeControllerIfNeeded(widget.items[_index]);
+    final len = widget.items.length;
+    if (len == 0) return;
+    setState(() => _index = _clampIndex(i, len));
   }
 
-  /// ------------------------------------------
-  /// UI
-  /// ------------------------------------------
+  String? _safeImageUrl(String? url) {
+    if (url == null) return null;
+    final t = url.trim();
+    if (t.isEmpty) return null;
+    final lower = t.toLowerCase().split('?').first;
+    if (lower.endsWith('.avif')) return null;
+    return t;
+  }
+
+  String? _thumbUrl(GwSliderItem it) {
+    final t = _safeImageUrl(it.thumb);
+    if (t != null) return t;
+
+    final ytThumb = gwYoutubeThumbFromSrc(it.src);
+    if (ytThumb != null) return ytThumb;
+
+    return _safeImageUrl(it.src);
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (widget.items.isEmpty) return const SizedBox.shrink();
+    final items = widget.items;
+    if (items.isEmpty) return const SizedBox.shrink();
 
-    final item = widget.items[_index];
+    final it = items[_index];
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // ===== メイン（16:9） =====
         Stack(
           children: [
-            AspectRatio(aspectRatio: 16 / 9, child: _buildMain(item)),
-
-            // 左矢印
+            AspectRatio(
+              aspectRatio: _ratio,
+              child: _MainMedia(
+                item: it,
+                canPlayYoutube: _canPlayYoutube,
+                autoPlay: widget.autoPlayVideo,
+                mute: widget.mute,
+              ),
+            ),
             Positioned(
               left: 8,
               top: 0,
@@ -151,8 +124,6 @@ class _GwPostSliderState extends State<GwPostSlider> {
                 child: _ArrowButton(icon: Icons.chevron_left, onTap: _prev),
               ),
             ),
-
-            // 右矢印
             Positioned(
               right: 8,
               top: 0,
@@ -163,61 +134,45 @@ class _GwPostSliderState extends State<GwPostSlider> {
             ),
           ],
         ),
-
         const SizedBox(height: 8),
-
-        // ===== サムネ（横スクロール） =====
         SizedBox(
-          height: 74,
+          height: _thumbH,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: 12),
-            itemCount: widget.items.length,
+            itemCount: items.length,
             separatorBuilder: (_, __) => const SizedBox(width: 8),
             itemBuilder: (context, i) {
-              final it = widget.items[i];
+              final t = items[i];
               final selected = i == _index;
-
-              // thumbがあればそれ、無ければ
-              // - youtube → youtubeサムネ
-              // - image   → srcをサムネとして使う
-              final thumbUrl = (it.thumb != null && it.thumb!.trim().isNotEmpty)
-                  ? it.thumb!.trim()
-                  : (it.type == 'youtube' ? _youtubeThumbFrom(it.src) : it.src);
+              final thumb = _thumbUrl(t);
 
               return InkWell(
                 onTap: () => _tapThumb(i),
                 child: Opacity(
                   opacity: selected ? 1.0 : 0.6,
                   child: Container(
-                    width: 118,
+                    width: _thumbW,
                     decoration: BoxDecoration(
                       borderRadius: BorderRadius.circular(10),
                       border: Border.all(
                         color: selected
-                            ? Colors.blueAccent
+                            ? Theme.of(context).colorScheme.primary
                             : Colors.transparent,
                         width: 2,
                       ),
                       color: Colors.black12,
                     ),
                     clipBehavior: Clip.antiAlias,
-                    child: thumbUrl == null
-                        ? Center(
-                            child: Icon(
-                              it.type == 'youtube'
-                                  ? Icons.play_circle
-                                  : Icons.image,
-                            ),
-                          )
+                    child: thumb == null
+                        ? Container(color: Colors.black12)
                         : CachedNetworkImage(
-                            imageUrl: thumbUrl,
+                            imageUrl: thumb,
                             fit: BoxFit.cover,
-                            placeholder: (_, __) => const Center(
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            ),
+                            placeholder: (_, __) =>
+                                Container(color: Colors.black12),
                             errorWidget: (_, __, ___) =>
-                                const Center(child: Icon(Icons.broken_image)),
+                                Container(color: Colors.black12),
                           ),
                   ),
                 ),
@@ -228,34 +183,85 @@ class _GwPostSliderState extends State<GwPostSlider> {
       ],
     );
   }
+}
 
-  /// メイン表示（画像 or YouTube）
-  Widget _buildMain(GwSliderItem item) {
-    if (item.type == 'youtube') {
-      // controllerが無い＝IDが取れない等
-      if (_yt == null) {
-        return const Center(child: Icon(Icons.play_circle, size: 56));
+class _MainMedia extends StatelessWidget {
+  const _MainMedia({
+    required this.item,
+    required this.canPlayYoutube,
+    required this.autoPlay,
+    required this.mute,
+  });
+
+  final GwSliderItem item;
+  final bool canPlayYoutube;
+  final bool autoPlay;
+  final bool mute;
+
+  String? _safeImageUrl(String? url) {
+    if (url == null) return null;
+    final t = url.trim();
+    if (t.isEmpty) return null;
+    final lower = t.toLowerCase().split('?').first;
+    if (lower.endsWith('.avif')) return null;
+    return t;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final id = gwExtractYoutubeId(item.src);
+
+    // ✅ YouTube
+    if (id != null && id.isNotEmpty) {
+      // macOS/Windows/Linux はプレイヤーを作らない（153回避）→ サムネ
+      if (!canPlayYoutube) {
+        final thumb = 'https://i.ytimg.com/vi/$id/hqdefault.jpg';
+        return CachedNetworkImage(
+          imageUrl: thumb,
+          fit: BoxFit.cover,
+          placeholder: (_, __) => Container(color: Colors.black12),
+          errorWidget: (_, __, ___) => Container(color: Colors.black12),
+        );
       }
-      return YoutubePlayer(controller: _yt!, showVideoProgressIndicator: true);
+
+      return IgnorePointer(
+        ignoring: true,
+        child: GwYoutubePlayer(
+          key: ValueKey('yt:$id'),
+          videoId: id,
+          autoPlay: autoPlay,
+          mute: mute,
+          useCard: false,
+          useAspectRatio: false,
+        ),
+      );
     }
 
-    // image
+    // ✅ Image
+    final img = _safeImageUrl(item.src);
+    if (img == null) return Container(color: Colors.black12);
+
+    final dpr = MediaQuery.of(context).devicePixelRatio;
+    final w = MediaQuery.of(context).size.width;
+    final cacheW = (w * dpr).round();
+    final cacheH = (w / (16 / 9) * dpr).round();
+
     return CachedNetworkImage(
-      imageUrl: item.src,
+      imageUrl: img,
       fit: BoxFit.cover,
-      placeholder: (_, __) => const Center(child: CircularProgressIndicator()),
-      errorWidget: (_, __, ___) =>
-          const Center(child: Icon(Icons.broken_image)),
+      memCacheWidth: cacheW,
+      memCacheHeight: cacheH,
+      placeholder: (_, __) => Container(color: Colors.black12),
+      errorWidget: (_, __, ___) => Container(color: Colors.black12),
     );
   }
 }
 
-/// 矢印ボタン（半透明の丸ボタン）
 class _ArrowButton extends StatelessWidget {
+  const _ArrowButton({required this.icon, required this.onTap});
+
   final IconData icon;
   final VoidCallback onTap;
-
-  const _ArrowButton({required this.icon, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
