@@ -1,0 +1,170 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:youtube_player_iframe/youtube_player_iframe.dart';
+
+/// ============================================================
+/// GwYoutubePlayer（youtube_player_iframe 5.2.2 対応版）
+/// ============================================================
+/// ✅ なぜ書き直す？
+/// - YoutubePlayerValue に `isReady` / `position` が無い（古い書き方で落ちる）
+///
+/// ✅ 互換目的（呼び出し側に合わせて引数を受ける）
+/// - autoplay
+/// - showYoutubeControls
+/// - enableTapToPlay
+/// - showOverlaySeek
+///
+/// ※ showOverlaySeek は「UI表示のON/OFF」だけ吸収して、
+///   まずは “ビルドを通す” のを優先（必要なら後でUI追加）
+class GwYoutubePlayer extends StatefulWidget {
+  const GwYoutubePlayer({
+    super.key,
+    required this.videoId,
+
+    // 呼び出し側が autoplay: を渡してくるので名前を合わせる
+    this.autoplay = false,
+
+    // ブラウザ/モバイルの自動再生制限回避のため mute=true 推奨
+    this.mute = true,
+
+    // 16:9固定にしたいなら true
+    this.useAspectRatio = true,
+
+    // Cardで包むか
+    this.useCard = true,
+
+    // YouTube標準コントロールを出すか
+    this.showYoutubeControls = true,
+
+    // タップで再生/停止を切り替える（コントロール非表示でも操作できる）
+    this.enableTapToPlay = false,
+
+    // タイムライン用：オーバーレイでシークUIを出すか（今は吸収のみ）
+    this.showOverlaySeek = false,
+
+    // 呼び出し側の aspectRatio: を受け取る
+    this.aspectRatio,
+  });
+
+  final String videoId;
+  final bool autoplay;
+  final bool mute;
+  final bool useAspectRatio;
+  final bool useCard;
+  final bool showYoutubeControls;
+  final bool enableTapToPlay;
+  final bool showOverlaySeek;
+  // 呼び出し側の aspectRatio: を受け取る
+  final double? aspectRatio;
+
+  @override
+  State<GwYoutubePlayer> createState() => _GwYoutubePlayerState();
+}
+
+class _GwYoutubePlayerState extends State<GwYoutubePlayer> {
+  late final YoutubePlayerController _controller;
+
+  StreamSubscription<YoutubePlayerValue>? _valueSub;
+  StreamSubscription<YoutubeVideoState>? _videoStateSub;
+
+  // 「準備できたか」を自前で持つ（value.isReady は存在しない）
+  bool _ready = false;
+
+  // 再生位置は value.position では取れない → videoStateStream から取る
+  Duration _position = Duration.zero;
+
+  // isReady の代替：unknown を抜けたら準備できた扱い
+  bool _isReady(YoutubePlayerValue v) => v.playerState != PlayerState.unknown;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // showControls は widget.showYoutubeControls を反映する（固定trueはダメ）
+    _controller = YoutubePlayerController.fromVideoId(
+      videoId: widget.videoId,
+      params: YoutubePlayerParams(
+        showControls: widget.showYoutubeControls,
+        showFullscreenButton: false,
+        mute: widget.mute,
+      ),
+    );
+
+    // 1) playerState等を監視して ready になった瞬間に autoplay
+    _valueSub = _controller.stream.listen((v) async {
+      if (!_ready && _isReady(v)) {
+        _ready = true;
+
+        if (widget.mute) {
+          await _controller.mute();
+        }
+        if (widget.autoplay) {
+          await _controller.playVideo();
+        }
+      }
+    });
+
+    // 2) 位置（position）を監視（YoutubeVideoState.position）
+    _videoStateSub = _controller.videoStateStream.listen((s) {
+      _position = s.position;
+    });
+  }
+
+  // タップで再生/停止トグル（enableTapToPlay 用）
+  Future<void> _togglePlayPause() async {
+    if (!_ready) return;
+    final st = _controller.value.playerState;
+    if (st == PlayerState.playing) {
+      await _controller.pauseVideo();
+    } else {
+      await _controller.playVideo();
+    }
+  }
+
+  // 必要なら外から使える
+  Future<void> safePlay() async {
+    if (!_ready) return;
+    await _controller.playVideo();
+  }
+
+  Future<void> safePause() async {
+    if (!_ready) return;
+    await _controller.pauseVideo();
+  }
+
+  int get nowSeconds => _position.inSeconds;
+
+  @override
+  void dispose() {
+    _valueSub?.cancel();
+    _videoStateSub?.cancel();
+    _controller.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // aspectRatio は 0 にしない（壊れる原因になる）
+    final ar = widget.aspectRatio ?? 16 / 9;
+
+    final player = YoutubePlayer(controller: _controller, aspectRatio: ar);
+
+    Widget child = player;
+
+    // コントロール無しでもタップで操作できるようにする
+    if (widget.enableTapToPlay) {
+      child = GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _togglePlayPause,
+        child: child,
+      );
+    }
+
+    // showOverlaySeek は “引数吸収” 済み。
+    // まずはビルドを通すのを優先。必要なら後でUI追加する。
+
+    if (!widget.useCard) return child;
+
+    return Card(clipBehavior: Clip.antiAlias, child: child);
+  }
+}

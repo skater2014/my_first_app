@@ -1,0 +1,163 @@
+import 'package:flutter/material.dart';
+import 'package:youtube_player_iframe/youtube_player_iframe.dart';
+import 'package:visibility_detector/visibility_detector.dart';
+
+/// ✅ GwYoutubePlayer（互換維持版）
+///
+/// - 旧: autoplay / showOverlaySeek を受けても落ちない
+/// - 新: shouldPlay / autoPlayOnVisible で制御できる
+/// - youtube_player_iframe の YoutubePlayer には onReady が無いので使わない
+class GwYoutubePlayer extends StatefulWidget {
+  const GwYoutubePlayer({
+    super.key,
+    required this.videoId,
+
+    // ---- 互換（旧呼び出し）----
+    bool autoplay = false, // 旧: autoplay
+    this.showOverlaySeek = false, // 旧: showOverlaySeek（互換・未使用）
+    // ---- 現行（推奨）----
+    bool? shouldPlay,
+    this.autoPlayOnVisible = false,
+    this.visibleFractionToPlay = 0.65,
+
+    // ---- 見た目/挙動 ----
+    this.mute = true,
+    this.showControls = true,
+    this.useAspectRatio = true,
+    this.useCard = true,
+  }) : shouldPlay = shouldPlay ?? autoplay;
+
+  final String videoId;
+
+  /// 再生するべきか（autoPlayOnVisible=false のときに使う）
+  final bool shouldPlay;
+
+  /// スクロールで見えたら自動再生（インスタ風）
+  final bool autoPlayOnVisible;
+  final double visibleFractionToPlay;
+
+  final bool mute;
+  final bool showControls;
+  final bool useAspectRatio;
+  final bool useCard;
+
+  /// 互換用（今は未使用）
+  final bool showOverlaySeek;
+
+  @override
+  State<GwYoutubePlayer> createState() => _GwYoutubePlayerState();
+}
+
+class _GwYoutubePlayerState extends State<GwYoutubePlayer> {
+  late final YoutubePlayerController _c;
+
+  bool _visibleEnough = false;
+  bool _appliedOnce = false;
+
+  bool get _shouldPlayNow =>
+      widget.autoPlayOnVisible ? _visibleEnough : widget.shouldPlay;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _c = YoutubePlayerController(
+      params: YoutubePlayerParams(
+        mute: widget.mute,
+        showControls: widget.showControls,
+        showFullscreenButton: false,
+        playsInline: true,
+      ),
+    );
+
+    // まず読み込み
+    _c.loadVideoById(videoId: widget.videoId);
+
+    // IFrame生成後に play/pause を当てる（autoplay=1 が内部で効くため）
+    WidgetsBinding.instance.addPostFrameCallback((_) => _applyPlayPolicy());
+  }
+
+  void _applyPlayPolicy() {
+    if (!mounted) return;
+
+    // mute/unmute
+    if (widget.mute) {
+      _c.mute();
+    } else {
+      _c.unMute();
+    }
+
+    // play/pause
+    if (_shouldPlayNow) {
+      _c.playVideo();
+    } else {
+      _c.pauseVideo();
+    }
+
+    _appliedOnce = true;
+  }
+
+  @override
+  void didUpdateWidget(covariant GwYoutubePlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    // 動画IDが変わったら読み込み直し
+    if (oldWidget.videoId != widget.videoId) {
+      _appliedOnce = false;
+      _c.loadVideoById(videoId: widget.videoId);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _applyPlayPolicy());
+      return;
+    }
+
+    // 再生条件が変わったら当て直し
+    final changed =
+        oldWidget.mute != widget.mute ||
+        oldWidget.shouldPlay != widget.shouldPlay ||
+        oldWidget.autoPlayOnVisible != widget.autoPlayOnVisible;
+
+    if (!_appliedOnce || changed) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _applyPlayPolicy());
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    Widget player = YoutubePlayer(
+      controller: _c,
+      aspectRatio: widget.useAspectRatio ? 16 / 9 : 16 / 9,
+    );
+
+    Widget body = player;
+
+    if (widget.useCard) {
+      body = Material(
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: body,
+      );
+    }
+
+    if (widget.autoPlayOnVisible) {
+      body = VisibilityDetector(
+        key: ValueKey('yt-vis-${widget.videoId}'),
+        onVisibilityChanged: (info) {
+          final frac = info.visibleFraction.clamp(0.0, 1.0);
+          final next = frac >= widget.visibleFractionToPlay;
+          if (next != _visibleEnough) {
+            _visibleEnough = next;
+            _applyPlayPolicy();
+          }
+        },
+        child: body,
+      );
+    }
+
+    return body;
+  }
+}

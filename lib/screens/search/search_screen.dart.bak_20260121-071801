@@ -1,0 +1,177 @@
+import 'package:flutter/material.dart';
+
+import 'gw_search_controller.dart';
+import 'search_models.dart';
+import 'search_widgets.dart';
+
+class SearchScreen extends StatefulWidget {
+  const SearchScreen({super.key});
+
+  @override
+  State<SearchScreen> createState() => _SearchScreenState();
+}
+
+class _SearchScreenState extends State<SearchScreen> {
+  late final GwSearchController _c;
+  final _textController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _c = GwSearchController()..boot();
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    _c.disposeController();
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final listen = Listenable.merge([_c, _textController]);
+
+    return AnimatedBuilder(
+      animation: listen,
+      builder: (context, _) {
+        final s = _c.state;
+
+        final title = switch (s.tab) {
+          SearchTab.all => 'All',
+          SearchTab.genshin => 'Genshin',
+          SearchTab.tekken => 'Tekken',
+        };
+
+        return Scaffold(
+          appBar: AppBar(
+            title: Text(title),
+            actions: [
+              if (s.tab == SearchTab.genshin)
+                IconButton(
+                  tooltip: 'Clear filters',
+                  onPressed: _c.resetFilters,
+                  icon: const Icon(Icons.filter_alt_off),
+                ),
+            ],
+          ),
+          body: SafeArea(
+            child: Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                  child: TextField(
+                    controller: _textController,
+                    onChanged: _c.setQuery,
+                    textInputAction: TextInputAction.search,
+                    decoration: InputDecoration(
+                      prefixIcon: const Icon(Icons.search),
+                      hintText: 'Search (local filter)',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      isDense: true,
+                      suffixIcon: _textController.text.isEmpty
+                          ? null
+                          : IconButton(
+                              icon: const Icon(Icons.clear),
+                              onPressed: () {
+                                _textController.clear();
+                                _c.clearQuery();
+                              },
+                            ),
+                    ),
+                  ),
+                ),
+
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                  child: SegmentedButton<SearchTab>(
+                    segments: const [
+                      ButtonSegment(value: SearchTab.all, label: Text('All')),
+                      ButtonSegment(
+                        value: SearchTab.genshin,
+                        label: Text('Genshin'),
+                      ),
+                      ButtonSegment(
+                        value: SearchTab.tekken,
+                        label: Text('Tekken'),
+                      ),
+                    ],
+                    selected: {s.tab},
+                    onSelectionChanged: (set) {
+                      _textController.clear();
+                      _c.switchTab(set.first);
+                    },
+                  ),
+                ),
+
+                if (!s.taxonomyReady)
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(12, 0, 12, 10),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text('Resolving taxonomy (slug → id)...'),
+                    ),
+                  ),
+
+                // genshin only filters (tag idsが取れてる時だけ)
+                if (s.tab == SearchTab.genshin && s.taxonomyReady)
+                  SearchFilters(
+                    state: s,
+                    onClear: _c.resetFilters,
+                    onToggleRarity: _c.toggleRarity,
+                    onToggleElement: _c.toggleElement,
+                    onToggleWeapon: _c.toggleWeapon,
+                  ),
+
+                Expanded(
+                  child: RefreshIndicator(
+                    onRefresh: _c.refresh,
+                    child: _buildBody(context, s),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildBody(BuildContext context, SearchState s) {
+    if (s.loading && s.allItems.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (s.error != null && s.allItems.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          const SizedBox(height: 120),
+          Center(child: Text(s.error!)),
+          const SizedBox(height: 12),
+          Center(
+            child: FilledButton(onPressed: _c.boot, child: const Text('Retry')),
+          ),
+        ],
+      );
+    }
+
+    return SearchGrid(
+      items: s.viewItems,
+      loading: s.loading && s.allItems.isNotEmpty,
+      onTapItem: (item) => _openItem(context, item),
+    );
+  }
+
+  void _openItem(BuildContext context, SearchItem item) {
+    // ✅ それ以外は一旦デバッグ（君の本物詳細に差し替え）
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('tap: ${item.name} (id=${item.id}, base=${item.base})'),
+      ),
+    );
+  }
+}

@@ -1,0 +1,321 @@
+import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:visibility_detector/visibility_detector.dart';
+import '../../utils/gw_url.dart';
+
+import 'search_models.dart';
+import 'gw_search_controller.dart';
+import '../../utils/gw_youtube.dart';
+import '../../widgets/gw_youtube_player.dart';
+
+class SearchFilters extends StatelessWidget {
+  const SearchFilters({
+    super.key,
+    required this.state,
+    required this.onClear,
+    required this.onToggleRarity,
+    required this.onToggleElement,
+    required this.onToggleWeapon,
+  });
+
+  final SearchState state;
+  final VoidCallback onClear;
+  final void Function(int) onToggleRarity;
+  final void Function(int) onToggleElement;
+  final void Function(int) onToggleWeapon;
+
+  @override
+  Widget build(BuildContext context) {
+    // このUIは“見た目用”。実際のフィルタは controller 側で state を見て適用。
+    final hasAny =
+        state.selectedRarities.isNotEmpty ||
+        state.selectedElements.isNotEmpty ||
+        state.selectedWeapons.isNotEmpty;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          if (hasAny)
+            TextButton(onPressed: onClear, child: const Text('Clear')),
+
+          // Rarity
+          _chipRow(
+            label: 'Rarity',
+            values: const [5, 4],
+            selected: state.selectedRarities,
+            onTap: onToggleRarity,
+          ),
+
+          // Element
+          _chipRow(
+            label: 'Element',
+            values: const [1, 2, 3, 4, 5, 6, 7],
+            selected: state.selectedElements,
+            onTap: onToggleElement,
+          ),
+
+          // Weapon
+          _chipRow(
+            label: 'Weapon',
+            values: const [1, 2, 3, 4, 5],
+            selected: state.selectedWeapons,
+            onTap: onToggleWeapon,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _chipRow({
+    required String label,
+    required List<int> values,
+    required Set<int> selected,
+    required void Function(int) onTap,
+  }) {
+    return Wrap(
+      spacing: 6,
+      runSpacing: 6,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        Text(label),
+        for (final v in values)
+          FilterChip(
+            label: Text('$v'),
+            selected: selected.contains(v),
+            onSelected: (_) => onTap(v),
+          ),
+      ],
+    );
+  }
+}
+
+/// ✅ Search 一覧で “タイムライン方式” 再生
+/// - VisibilityDetector で見えてる割合が最大の item を active にする
+/// - active の YouTube だけ GwYoutubePlayer を描画（＝それ以外はサムネ）
+class SearchGrid extends StatefulWidget {
+  const SearchGrid({
+    super.key,
+    required this.items,
+    required this.loading,
+    required this.onTapItem,
+  });
+
+  final List<SearchItem> items;
+  final bool loading;
+  final void Function(SearchItem item) onTapItem;
+
+  @override
+  State<SearchGrid> createState() => _SearchGridState();
+}
+
+class _SearchGridState extends State<SearchGrid> {
+  final Map<int, double> _visible = {};
+  int? _activeId;
+
+  void _onVisible(int id, double fraction) {
+    if (fraction <= 0) {
+      _visible.remove(id);
+    } else {
+      _visible[id] = fraction;
+    }
+
+    int? bestId;
+    double best = 0;
+
+    _visible.forEach((k, v) {
+      if (v > best) {
+        best = v;
+        bestId = k;
+      }
+    });
+
+    if (bestId == null) return;
+    if (best < 0.60) return; // これより小さいと切り替えがチラつく
+    if (_activeId == bestId) return;
+
+    setState(() => _activeId = bestId);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final items = widget.items;
+
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      children: [
+        GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: items.length,
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 2,
+            crossAxisSpacing: 12,
+            mainAxisSpacing: 12,
+            childAspectRatio: 0.78,
+          ),
+          itemBuilder: (context, i) {
+            final it = items[i];
+            final vid = (it.videoId ?? '').trim();
+            final hasVideo = it.hasYoutube && vid.isNotEmpty;
+            final active = hasVideo && (_activeId == it.id);
+
+            return VisibilityDetector(
+              key: Key('search-${it.id}'),
+              onVisibilityChanged: (info) =>
+                  _onVisible(it.id, info.visibleFraction),
+              child: _Card(
+                item: it,
+                videoId: hasVideo ? vid : null,
+                activeVideo: active,
+                onTap: () => widget.onTapItem(it),
+              ),
+            );
+          },
+        ),
+        if (widget.loading) ...[
+          const SizedBox(height: 16),
+          const Center(child: CircularProgressIndicator()),
+          const SizedBox(height: 16),
+        ],
+      ],
+    );
+  }
+}
+
+class _Card extends StatelessWidget {
+  const _Card({
+    required this.item,
+    required this.onTap,
+    required this.videoId,
+    required this.activeVideo,
+  });
+
+  final SearchItem item;
+  final VoidCallback onTap;
+  final String? videoId;
+  final bool activeVideo;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    // 画像サムネ（YouTubeなら gwYoutubeThumbFromSrc を優先）
+    String? thumb;
+    if (item.thumbUrl != null && item.thumbUrl!.trim().isNotEmpty) {
+      thumb = gwFixMediaUrl(item.thumbUrl) ?? item.thumbUrl!.trim();
+    } else if ((videoId ?? '').isNotEmpty) {
+      final vid = videoId!;
+      thumb =
+          gwYoutubeThumbFromSrc(vid) ??
+          ('https://img.youtube.com/vi/' + vid + '/hqdefault.jpg');
+    }
+
+    Widget media;
+    if (activeVideo && (videoId ?? '').isNotEmpty) {
+      media = GwYoutubePlayer(
+        videoId: videoId!,
+        autoplay: true,
+        mute: true,
+        showYoutubeControls: false,
+        enableTapToPlay: true,
+        showOverlaySeek: false,
+        useCard: false,
+        aspectRatio: 16 / 9,
+      );
+    } else if (thumb != null && thumb.isNotEmpty) {
+      media = CachedNetworkImage(
+        imageUrl: thumb,
+        fit: BoxFit.cover,
+        placeholder: (_, __) => _placeholder(),
+        errorWidget: (_, __, ___) => _placeholder(),
+      );
+    } else {
+      media = _placeholder();
+    }
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Ink(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(14),
+          color: cs.surface,
+          border: Border.all(color: Theme.of(context).dividerColor),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // thumbnail / video
+            Expanded(
+              child: ClipRRect(
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(14),
+                ),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    media,
+
+                    if (item.hasYoutube)
+                      Positioned(
+                        left: 8,
+                        bottom: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(999),
+                            color: Colors.black.withOpacity(0.55),
+                          ),
+                          child: Text(
+                            activeVideo ? 'PLAY' : 'YT',
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+
+            // title
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+              child: Text(
+                item.name,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+            ),
+
+            // base label
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+              child: Text(
+                item.base,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.labelSmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _placeholder() {
+    return Container(
+      color: Colors.black12,
+      child: const Center(child: Icon(Icons.image_not_supported_outlined)),
+    );
+  }
+}

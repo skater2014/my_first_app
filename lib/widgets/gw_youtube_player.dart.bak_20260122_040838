@@ -1,0 +1,102 @@
+import 'package:flutter/material.dart';
+import 'package:youtube_player_iframe/youtube_player_iframe.dart';
+
+/// ✅ 重要：このWidgetは「必ず有限の高さ」を持つ（AspectRatio）
+/// - SliverToBoxAdapter / List / Grid どこに入れても Infinity 高さで死なない
+/// - feed でタッチを奪いたくない場合は、呼び出し側で IgnorePointer を付ける（今の実装でOK）
+class GwYoutubePlayer extends StatefulWidget {
+  const GwYoutubePlayer({
+    super.key,
+    required this.videoId,
+    this.autoplay = false,
+    this.mute = true,
+    this.showYoutubeControls = true,
+    this.enableTapToPlay = true,
+    this.showOverlaySeek = true,
+    this.aspectRatio = 16 / 9,
+    this.useCard = true,
+  });
+
+  final String videoId;
+  final bool autoplay;
+  final bool mute;
+
+  final bool showYoutubeControls;
+  final bool enableTapToPlay;
+  final bool showOverlaySeek;
+
+  final double aspectRatio;
+  final bool useCard;
+
+  @override
+  State<GwYoutubePlayer> createState() => _GwYoutubePlayerState();
+}
+
+class _GwYoutubePlayerState extends State<GwYoutubePlayer> {
+  late YoutubePlayerController _c;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = YoutubePlayerController.fromVideoId(
+      videoId: widget.videoId,
+      params: YoutubePlayerParams(
+        autoPlay: widget.autoplay,
+        mute: widget.mute,
+        showControls: widget.showYoutubeControls,
+        showFullscreenButton: false,
+        enableJavaScript: true,
+        playsInline: true,
+        strictRelatedVideos: true,
+      ),
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant GwYoutubePlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (oldWidget.videoId != widget.videoId) {
+      _c.loadVideoById(videoId: widget.videoId);
+    }
+
+    // mute / autoplay は状況次第で変わるので反映
+    if (oldWidget.mute != widget.mute) {
+      widget.mute ? _c.mute() : _c.unMute();
+    }
+    if (oldWidget.autoplay != widget.autoplay && widget.autoplay) {
+      _c.playVideo();
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final vid = widget.videoId.trim();
+    if (vid.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    Widget body = AspectRatio(
+      aspectRatio: widget.aspectRatio,
+      child: ClipRect(
+        child: YoutubePlayer(controller: _c, aspectRatio: widget.aspectRatio),
+      ),
+    );
+
+    if (widget.useCard) {
+      body = Material(
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: body,
+      );
+    }
+
+    return body;
+  }
+}

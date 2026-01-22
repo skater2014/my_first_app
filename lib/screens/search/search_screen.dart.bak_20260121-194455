@@ -1,0 +1,269 @@
+import 'package:flutter/material.dart';
+
+import 'gw_search_controller.dart';
+import 'search_models.dart';
+import 'search_widgets.dart';
+
+class SearchScreen extends StatefulWidget {
+  const SearchScreen({super.key});
+
+  @override
+  State<SearchScreen> createState() => _SearchScreenState();
+}
+
+class _SearchScreenState extends State<SearchScreen> {
+  late final GwSearchController _c;
+  final _textController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _c = GwSearchController()..boot();
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    _c.disposeController();
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final listen = Listenable.merge([_c, _textController]);
+
+    return AnimatedBuilder(
+      animation: listen,
+      builder: (context, _) {
+        final s = _c.state;
+
+        return Scaffold(
+          // ✅ 「All」みたいなタイトル文字は消す（不要なら）
+          appBar: AppBar(
+            title: const SizedBox.shrink(), // 「Search」文字は出さない
+            actions: [
+              // ✅ Genshin のときだけフィルタ（popup）
+              if (s.tab == SearchTab.genshin && s.taxonomyReady)
+                IconButton(
+                  tooltip: 'Filters',
+                  icon: const Icon(Icons.filter_alt),
+                  onPressed: () {
+                    showModalBottomSheet(
+                      context: context,
+                      showDragHandle: true,
+                      isScrollControlled: false,
+                      builder: (_) => Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+                        child: SearchFilters(
+                          state: s,
+                          onClear: _c.resetFilters,
+                          onToggleRarity: _c.toggleRarity,
+                          onToggleElement: _c.toggleElement,
+                          onToggleWeapon: _c.toggleWeapon,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+            ],
+            bottom: PreferredSize(
+              preferredSize: const Size.fromHeight(110),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+                child: Column(
+                  children: [
+                    TextField(
+                      controller: _textController,
+                      onChanged: _c.setQuery,
+                      textInputAction: TextInputAction.search,
+                      decoration: InputDecoration(
+                        prefixIcon: const Icon(Icons.search),
+                        hintText: 'Search',
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        isDense: true,
+                        suffixIcon: _textController.text.isEmpty
+                            ? null
+                            : IconButton(
+                                icon: const Icon(Icons.clear),
+                                onPressed: () {
+                                  _textController.clear();
+                                  _c.clearQuery();
+                                },
+                              ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    SegmentedButton<SearchTab>(
+                      segments: const [
+                        ButtonSegment(value: SearchTab.all, label: Text('All')),
+                        ButtonSegment(value: SearchTab.genshin, label: Text('Genshin')),
+                        ButtonSegment(value: SearchTab.tekken, label: Text('Tekken')),
+                      ],
+                      selected: {s.tab},
+                      onSelectionChanged: (set) {
+                        _textController.clear();
+                        _c.switchTab(set.first);
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),,
+            toolbarHeight: 0, // ここで “AppBarのタイトル行” を消す
+          ),
+          body: SafeArea(
+            child: RefreshIndicator(
+              onRefresh: _c.refresh,
+              child: NestedScrollView(
+                headerSliverBuilder: (context, innerScrolled) => [
+                  SliverAppBar(
+                    pinned: true,
+                    automaticallyImplyLeading: false,
+                    // ✅ 上の固定領域の高さ（検索 + タブ + （genshinフィルタが出るならその分））
+                    // フィルタが出たときだけ高さが増える
+                    toolbarHeight: 0,
+                    collapsedHeight: _headerHeight(context, s),
+                    expandedHeight: _headerHeight(context, s),
+                    flexibleSpace: Container(
+                      color: Theme.of(context).scaffoldBackgroundColor,
+                      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          // ✅ Search box
+                          TextField(
+                            controller: _textController,
+                            onChanged: _c.setQuery,
+                            textInputAction: TextInputAction.search,
+                            decoration: InputDecoration(
+                              prefixIcon: const Icon(Icons.search),
+                              hintText: 'Search (local filter)',
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              isDense: true,
+                              suffixIcon: _textController.text.isEmpty
+                                  ? null
+                                  : IconButton(
+                                      icon: const Icon(Icons.clear),
+                                      onPressed: () {
+                                        _textController.clear();
+                                        _c.clearQuery();
+                                      },
+                                    ),
+                            ),
+                          ),
+
+                          const SizedBox(height: 8),
+
+                          // ✅ All / Genshin / Tekken をここに固定
+                          SegmentedButton<SearchTab>(
+                            segments: const [
+                              ButtonSegment(
+                                value: SearchTab.all,
+                                label: Text('All'),
+                              ),
+                              ButtonSegment(
+                                value: SearchTab.genshin,
+                                label: Text('Genshin'),
+                              ),
+                              ButtonSegment(
+                                value: SearchTab.tekken,
+                                label: Text('Tekken'),
+                              ),
+                            ],
+                            selected: {s.tab},
+                            onSelectionChanged: (set) {
+                              _textController.clear();
+                              _c.switchTab(set.first);
+                            },
+                          ),
+
+                          const SizedBox(height: 8),
+
+                          if (!s.taxonomyReady)
+                            const Align(
+                              alignment: Alignment.centerLeft,
+                              child: Padding(
+                                padding: EdgeInsets.only(bottom: 6),
+                                child: Text(
+                                  'Resolving taxonomy (slug → id)...',
+                                ),
+                              ),
+                            ),
+
+                          // ✅ genshinフィルタもヘッダー内に固定表示
+                          if (s.tab == SearchTab.genshin && s.taxonomyReady)
+                            SearchFilters(
+                              state: s,
+                              onClear: _c.resetFilters,
+                              onToggleRarity: _c.toggleRarity,
+                              onToggleElement: _c.toggleElement,
+                              onToggleWeapon: _c.toggleWeapon,
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+                // ✅ ここが “スクロールする本体（Grid）”
+                body: _buildBody(context, s),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // ヘッダー高さの計算（フィルタが出る時だけ増やす）
+  double _headerHeight(BuildContext context, SearchState s) {
+    // おおまかな固定値（端末差は許容）
+    double h =
+        10 + 56 + 8 + 40 + 8; // padding + TextField + gap + Segmented + gap
+    if (!s.taxonomyReady) h += 24; // “Resolving...” 行
+    if (s.tab == SearchTab.genshin && s.taxonomyReady) {
+      // SearchFilters は Wrap なので行数により変動するが、まずはこのくらい
+      h += 72;
+    }
+    return h;
+  }
+
+  Widget _buildBody(BuildContext context, SearchState s) {
+    if (s.loading && s.allItems.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (s.error != null && s.allItems.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          const SizedBox(height: 120),
+          Center(child: Text(s.error!)),
+          const SizedBox(height: 12),
+          Center(
+            child: FilledButton(onPressed: _c.boot, child: const Text('Retry')),
+          ),
+        ],
+      );
+    }
+
+    return SearchGrid(
+      items: s.viewItems,
+      loading: s.loading && s.allItems.isNotEmpty,
+      onTapItem: (item) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'tap: ${item.name} (id=${item.id}, base=${item.base})',
+            ),
+          ),
+        );
+      },
+    );
+  }
+}

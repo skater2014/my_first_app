@@ -1,0 +1,361 @@
+import 'package:flutter/material.dart';
+
+import 'package:my_first_app/screens/genshin_characters_screen.dart';
+import 'package:my_first_app/screens/tekken_characters_screen.dart';
+
+;
+;
+;
+
+enum _SubTab { back, timeline, character }
+
+class SearchScreen extends StatefulWidget {
+  const SearchScreen({super.key});
+
+  @override
+  State<SearchScreen> createState() => _SearchScreenState();
+}
+
+class _SearchScreenState extends State<SearchScreen> {
+  late final GwSearchController _c;
+  final _textController = TextEditingController();
+
+  _SubTab _sub = _SubTab.timeline;
+
+  // 原神キャラ用フィルタ状態
+  final Set<int> _gcRarities = {};
+  final Set<int> _gcElements = {};
+  final Set<int> _gcWeapons = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _c = GwSearchController()..boot();
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    _c.disposeController();
+    _c.dispose();
+    super.dispose();
+  }
+
+  void _resetCharacterFilters() {
+    _gcRarities.clear();
+    _gcElements.clear();
+    _gcWeapons.clear();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final listen = Listenable.merge([_c, _textController]);
+
+    return AnimatedBuilder(
+      animation: listen,
+      builder: (context, _) {
+        final s = _c.state;
+
+        // ✅ ここが本体：All以外なら「2段目」を出す
+        final showSub = s.tab != YourSearchTabClass.all;
+
+        // ✅ Allのときは常にTimeline扱い
+        final effectiveSub = showSub ? _sub : _SubTab.timeline;
+
+        return Scaffold(
+          body: SafeArea(
+            child: RefreshIndicator(
+              onRefresh: () async {
+                if (effectiveSub == _SubTab.timeline) {
+                  await _c.refresh();
+                }
+              },
+              child: NestedScrollView(
+                headerSliverBuilder: (context, innerScrolled) => [
+                  SliverAppBar(
+                    pinned: true,
+                    automaticallyImplyLeading: false,
+                    toolbarHeight: 0,
+                    collapsedHeight: _headerHeight(s, showSub, effectiveSub),
+                    expandedHeight: _headerHeight(s, showSub, effectiveSub),
+                    flexibleSpace: Container(
+                      color: Theme.of(context).scaffoldBackgroundColor,
+                      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          // 検索フォーム（Timeline=投稿検索 / Character=キャラ名フィルタ）
+                          TextField(
+                            controller: _textController,
+                            onChanged: (v) {
+                              if (effectiveSub == _SubTab.timeline) {
+                                _c.setQuery(v);
+                              } else {
+                                setState(() {}); // キャラ名絞り込み
+                              }
+                            },
+                            decoration: InputDecoration(
+                              prefixIcon: const Icon(Icons.search),
+                              hintText: 'Search',
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              isDense: true,
+                              suffixIcon: _textController.text.isEmpty
+                                  ? null
+                                  : IconButton(
+                                      icon: const Icon(Icons.clear),
+                                      onPressed: () {
+                                        _textController.clear();
+                                        if (effectiveSub == _SubTab.timeline) {
+                                          _c.clearQuery();
+                                        } else {
+                                          setState(() {});
+                                        }
+                                      },
+                                    ),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+
+                          // ===== 1段目（Allの時だけ表示）=====
+                          if (!showSub) ...[
+                            SegmentedButton<YourSearchTabClass>(
+                              segments: const [
+                                ButtonSegment(
+                                  value: YourSearchTabClass.all,
+                                  label: Text('All'),
+                                ),
+                                ButtonSegment(
+                                  value: YourSearchTabClass.genshin,
+                                  label: Text('Genshin'),
+                                ),
+                                ButtonSegment(
+                                  value: YourSearchTabClass.tekken,
+                                  label: Text('Tekken'),
+                                ),
+                              ],
+                              selected: {s.tab},
+                              onSelectionChanged: (set) {
+                                final v = set.first;
+
+                                // ✅ ここで「2段目に入る」準備をする
+                                setState(() => _sub = _SubTab.timeline);
+
+                                _textController.clear();
+                                _c.clearQuery();
+                                _c.switchTab(v);
+                                _resetCharacterFilters();
+                              },
+                            ),
+                          ] else ...[
+                            // ===== 2段目（All以外の時だけ表示）=====
+                            SegmentedButton<_SubTab>(
+                              segments: const [
+                                ButtonSegment(
+                                  value: _SubTab.back,
+                                  label: Text('Back'),
+                                ),
+                                ButtonSegment(
+                                  value: _SubTab.timeline,
+                                  label: Text('Timeline'),
+                                ),
+                                ButtonSegment(
+                                  value: _SubTab.character,
+                                  label: Text('Character'),
+                                ),
+                              ],
+                              selected: {_sub},
+                              onSelectionChanged: (set) {
+                                final v = set.first;
+
+                                if (v == _SubTab.back) {
+                                  // ✅ Allに戻す＝1段目が出る
+                                  setState(() => _sub = _SubTab.timeline);
+                                  _textController.clear();
+                                  _c.clearQuery();
+                                  _c.switchTab(YourSearchTabClass.all);
+                                  _resetCharacterFilters();
+                                  return;
+                                }
+
+                                setState(() => _sub = v);
+
+                                // Timelineに戻るなら controller に検索語を戻す
+                                if (v == _SubTab.timeline) {
+                                  _c.setQuery(_textController.text);
+                                }
+                              },
+                            ),
+                          ],
+
+                          // ===== 原神キャラ：Characterの時だけアイコンフィルタ =====
+                          if (effectiveSub == _SubTab.character &&
+                              s.tab == YourSearchTabClass.genshin)
+                            _GenshinCharacterIconFilters(
+                              rarities: _gcRarities,
+                              elements: _gcElements,
+                              weapons: _gcWeapons,
+                              onToggleRarity: (v) => setState(() {
+                                _gcRarities.contains(v)
+                                    ? _gcRarities.remove(v)
+                                    : _gcRarities.add(v);
+                              }),
+                              onToggleElement: (v) => setState(() {
+                                _gcElements.contains(v)
+                                    ? _gcElements.remove(v)
+                                    : _gcElements.add(v);
+                              }),
+                              onToggleWeapon: (v) => setState(() {
+                                _gcWeapons.contains(v)
+                                    ? _gcWeapons.remove(v)
+                                    : _gcWeapons.add(v);
+                              }),
+                              onClear: () => setState(_resetCharacterFilters),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+                body: _buildBody(context, s, effectiveSub),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  double _headerHeight(SearchState s, bool showSub, _SubTab sub) {
+    // padding + TextField + gap + segmented(1段 or 2段)
+    double h = 10 + 56 + 8 + 40;
+
+    // Character(原神) のときだけアイコンフィルタ段
+    if (sub == _SubTab.character && s.tab == YourSearchTabClass.genshin) {
+      h += 54;
+    }
+    return h;
+  }
+
+  Widget _buildBody(BuildContext context, SearchState s, _SubTab sub) {
+    // Timeline（投稿検索）
+    if (sub == _SubTab.timeline) {
+      if (s.loading && s.allItems.isEmpty) {
+        return const Center(child: CircularProgressIndicator());
+      }
+      if (s.error != null && s.allItems.isEmpty) {
+        return ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          children: [
+            const SizedBox(height: 120),
+            Center(child: Text(s.error!)),
+            const SizedBox(height: 12),
+            Center(
+              child: FilledButton(
+                onPressed: _c.boot,
+                child: const Text('Retry'),
+              ),
+            ),
+          ],
+        );
+      }
+      return YourSearchGridClass(
+        items: s.viewItems,
+        loading: s.loading && s.allItems.isNotEmpty,
+        onTapItem: (item) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('tap: ${item.name}')));
+        },
+      );
+    }
+
+    // Character（ゲーム別）
+    if (s.tab == YourSearchTabClass.genshin) {
+      return GenshinCharactersBody(
+        nameQuery: _textController.text,
+        rarities: _gcRarities,
+        elements: _gcElements,
+        weapons: _gcWeapons,
+      );
+    }
+
+    if (s.tab == YourSearchTabClass.tekken) {
+      return const TekkenCharactersBody();
+    }
+
+    return const Center(child: Text('Select Genshin/Tekken'));
+  }
+}
+
+// ============================================================
+// 原神：アイコンフィルタ（仮）
+// ============================================================
+class _GenshinCharacterIconFilters extends StatelessWidget {
+  const _GenshinCharacterIconFilters({
+    required this.rarities,
+    required this.elements,
+    required this.weapons,
+    required this.onToggleRarity,
+    required this.onToggleElement,
+    required this.onToggleWeapon,
+    required this.onClear,
+  });
+
+  final Set<int> rarities;
+  final Set<int> elements;
+  final Set<int> weapons;
+
+  final void Function(int) onToggleRarity;
+  final void Function(int) onToggleElement;
+  final void Function(int) onToggleWeapon;
+  final VoidCallback onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasAny =
+        rarities.isNotEmpty || elements.isNotEmpty || weapons.isNotEmpty;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+      child: SizedBox(
+        height: 46,
+        child: ListView(
+          scrollDirection: Axis.horizontal,
+          children: [
+            if (hasAny)
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: OutlinedButton(
+                  onPressed: onClear,
+                  child: const Text('Clear'),
+                ),
+              ),
+            _chip('★5', rarities.contains(5), () => onToggleRarity(5)),
+            const SizedBox(width: 6),
+            _chip('★4', rarities.contains(4), () => onToggleRarity(4)),
+            const SizedBox(width: 10),
+            for (final v in const [1, 2, 3, 4, 5, 6, 7]) ...[
+              _chip('E$v', elements.contains(v), () => onToggleElement(v)),
+              const SizedBox(width: 6),
+            ],
+            const SizedBox(width: 10),
+            for (final v in const [1, 2, 3, 4, 5]) ...[
+              _chip('W$v', weapons.contains(v), () => onToggleWeapon(v)),
+              const SizedBox(width: 6),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _chip(String label, bool selected, VoidCallback onTap) {
+    return FilterChip(
+      label: Text(label),
+      selected: selected,
+      onSelected: (_) => onTap(),
+    );
+  }
+}

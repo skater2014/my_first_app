@@ -1,0 +1,173 @@
+import 'package:flutter/material.dart'; // Flutter UI
+import 'package:cached_network_image/cached_network_image.dart'; // ネット画像（サムネ）
+import 'package:youtube_player_iframe/youtube_player_iframe.dart'; // YouTube iframe
+import '../utils/gw_youtube.dart'; // gwYoutubeThumbFromSrc を使う（あなたの util）
+
+/// ============================================================
+/// GwYoutubePlayer（最終方針）
+/// ------------------------------------------------------------
+/// ✅ YouTubeの上でもスクロール/スワイプが効く（操作を奪わない）
+/// ✅ “見えてる時だけ再生” = shouldPlay が true の時だけ再生
+/// ✅ shouldPlay=false の時は「サムネ画像だけ」を見せる（YouTubeボタンUIも見せない）
+/// ✅ autoplay パラメータは使わない（youtube_player_iframe 5.2.2 は内部で autoplay=1固定）
+///    → だから onReady で必ず pause してから、必要な時だけ playVideo() する
+/// ✅ ローディングスピナー禁止（プレースホルダは単色）
+/// ============================================================
+class GwYoutubePlayer extends StatefulWidget {
+  const GwYoutubePlayer({
+    super.key,
+    required this.videoId, // 11文字ID
+    required this.shouldPlay, // ← 見えてる（今表示中）なら true
+    this.mute = true, // ミュートするか
+    this.showYoutubeControls = false, // YouTube標準UIを出すか（基本 false）
+    this.enableTapToPlay = false, // 使わない（タップ再生させない）
+    this.showOverlaySeek = false, // 互換用（使わない）
+    this.aspectRatio = 16 / 9, // 高さ固定（Infinity事故防止）
+    this.useCard = false, // 角丸など（必要なら）
+  });
+
+  final String videoId; // YouTube ID
+  final bool shouldPlay; // 再生すべきか（親が決める）
+  final bool mute; // mute
+  final bool showYoutubeControls; // controls
+  final bool enableTapToPlay; // 未使用（タップ禁止）
+  final bool showOverlaySeek; // 未使用（互換）
+  final double aspectRatio; // 16/9
+  final bool useCard; // Card風
+
+  @override
+  State<GwYoutubePlayer> createState() => _GwYoutubePlayerState();
+}
+
+class _GwYoutubePlayerState extends State<GwYoutubePlayer> {
+  late final YoutubePlayerController _c; // YouTube制御
+  bool _ready = false; // onReady が来たか
+
+  @override
+  void initState() {
+    super.initState();
+
+    // ① controller を作る（autoplay は指定しない：このパッケージは内部で autoplay=1 になりがち）
+    _c = YoutubePlayerController.fromVideoId(
+      videoId: widget.videoId, // ② 対象動画
+      params: YoutubePlayerParams(
+        mute: widget.mute, // ③ 初期ミュート
+        showControls: widget.showYoutubeControls, // ④ 標準UI
+        showFullscreenButton: false, // ⑤ フルスクリーンボタン不要
+        enableJavaScript: true, // ⑥ JS API 有効
+        playsInline: true, // ⑦ iOSで全画面化しにくく
+        strictRelatedVideos: true, // ⑧ 関連動画を抑制
+      ),
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant GwYoutubePlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    // 動画IDが変わったらロードし直す
+    if (oldWidget.videoId != widget.videoId) {
+      _ready = false; // いったん未Ready扱いに戻す
+      _c.loadVideoById(videoId: widget.videoId); // 次の動画へ
+    }
+
+    // ミュートが変わったら反映
+    if (oldWidget.mute != widget.mute) {
+      widget.mute ? _c.mute() : _c.unMute();
+    }
+
+    // “見えてる/見えてない” が変わったら再生方針を適用
+    if (oldWidget.shouldPlay != widget.shouldPlay) {
+      _applyPolicy(); // play/pause + 表示切替
+    }
+  }
+
+  // ============================================================
+  // 再生ポリシー（重要）
+  // - shouldPlay=true  : YouTube表示して playVideo()
+  // - shouldPlay=false : サムネ表示に戻して pauseVideo()
+  // ============================================================
+  void _applyPolicy() {
+    if (!_ready) return; // Ready前は触らない
+
+    if (widget.shouldPlay) {
+      // 見えてる → 再生
+      _c.playVideo();
+    } else {
+      // 見えてない → 停止（サムネに戻す）
+      _c.pauseVideo();
+    }
+
+    // 見た目切替のため再描画
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _c.close(); // controller破棄
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final id = widget.videoId.trim(); // 余計な空白排除
+    if (id.isEmpty) return const SizedBox.shrink(); // IDが空なら何も出さない
+
+    // YouTubeサムネ（常に下に敷く）
+    final thumbUrl =
+        gwYoutubeThumbFromSrc(id) ?? 'https://i.ytimg.com/vi/$id/hqdefault.jpg';
+
+    // サムネ：ローディングスピナーは禁止 → 単色ボックスにする
+    final thumb = CachedNetworkImage(
+      imageUrl: thumbUrl,
+      fit: BoxFit.cover,
+      placeholder: (_, __) => const ColoredBox(color: Colors.black12), // スピナー禁止
+      errorWidget: (_, __, ___) => const ColoredBox(color: Colors.black12),
+    );
+
+    // YouTube本体（タッチを奪わないため IgnorePointer）
+    final player = IgnorePointer(
+      ignoring: true, // ← これで「YouTube面積でもスワイプが通る」
+      child: YoutubePlayer(
+        controller: _c, // controller
+        aspectRatio: widget.aspectRatio, // 比率固定
+        onReady: () {
+          // ✅ ここが最重要：
+          // youtube_player_iframe 5.2.2 は内部で autoplay=1 相当が入りやすい
+          // → だから Ready になった瞬間に必ず pause して勝手再生を止める
+          _ready = true; // Readyフラグ
+          _c.pauseVideo(); // 勝手再生を止める（ボタンも見せないための準備）
+          _applyPolicy(); // shouldPlay に従って play/pause
+        },
+      ),
+    );
+
+    // 見えてる時だけ YouTube を見せる（見えてない時は完全にサムネで覆う）
+    final bool showPlayer = widget.shouldPlay && _ready;
+
+    Widget body = AspectRatio(
+      aspectRatio: widget.aspectRatio, // 高さ固定（Infinity死を防ぐ）
+      child: ClipRect(
+        // はみ出し防止
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            thumb, // ① 常にサムネ（下）
+            if (showPlayer) player, // ② 今見えてる時だけ YouTube（上）
+          ],
+        ),
+      ),
+    );
+
+    // Card風の角丸が必要ならここで包む
+    if (widget.useCard) {
+      body = Material(
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: body,
+      );
+    }
+
+    return body; // 完成
+  }
+}

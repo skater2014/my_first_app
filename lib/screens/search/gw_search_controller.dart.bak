@@ -1,0 +1,299 @@
+// lib/screens/search/gw_search_controller.dart
+import 'package:flutter/foundation.dart';
+
+import 'search_models.dart';
+import 'search_repository.dart';
+
+@immutable
+class SearchState {
+  final bool loading;
+  final String? error;
+
+  final SearchTab tab;
+  final String query;
+
+  final bool taxonomyReady;
+  final int genshinCategoryId;
+  final int tekkenCategoryId;
+
+  final Map<String, int> rarityTagId;
+  final Map<String, int> elementTagId;
+  final Map<String, int> weaponTagId;
+
+  final Set<int> selRarityTags;
+  final Set<int> selElementTags;
+  final Set<int> selWeaponTags;
+
+  final List<SearchItem> allItems;
+  final List<SearchItem> viewItems;
+
+  const SearchState({
+    required this.loading,
+    required this.error,
+    required this.tab,
+    required this.query,
+    required this.taxonomyReady,
+    required this.genshinCategoryId,
+    required this.tekkenCategoryId,
+    required this.rarityTagId,
+    required this.elementTagId,
+    required this.weaponTagId,
+    required this.selRarityTags,
+    required this.selElementTags,
+    required this.selWeaponTags,
+    required this.allItems,
+    required this.viewItems,
+  });
+
+  factory SearchState.initial() => const SearchState(
+    loading: false,
+    error: null,
+    tab: SearchTab.all,
+    query: '',
+    taxonomyReady: false,
+    genshinCategoryId: 0,
+    tekkenCategoryId: 0,
+    rarityTagId: {},
+    elementTagId: {},
+    weaponTagId: {},
+    selRarityTags: {},
+    selElementTags: {},
+    selWeaponTags: {},
+    allItems: [],
+    viewItems: [],
+  );
+
+  SearchState copyWith({
+    bool? loading,
+    String? error,
+    SearchTab? tab,
+    String? query,
+    bool? taxonomyReady,
+    int? genshinCategoryId,
+    int? tekkenCategoryId,
+    Map<String, int>? rarityTagId,
+    Map<String, int>? elementTagId,
+    Map<String, int>? weaponTagId,
+    Set<int>? selRarityTags,
+    Set<int>? selElementTags,
+    Set<int>? selWeaponTags,
+    List<SearchItem>? allItems,
+    List<SearchItem>? viewItems,
+  }) {
+    return SearchState(
+      loading: loading ?? this.loading,
+      error: error,
+      tab: tab ?? this.tab,
+      query: query ?? this.query,
+      taxonomyReady: taxonomyReady ?? this.taxonomyReady,
+      genshinCategoryId: genshinCategoryId ?? this.genshinCategoryId,
+      tekkenCategoryId: tekkenCategoryId ?? this.tekkenCategoryId,
+      rarityTagId: rarityTagId ?? this.rarityTagId,
+      elementTagId: elementTagId ?? this.elementTagId,
+      weaponTagId: weaponTagId ?? this.weaponTagId,
+      selRarityTags: selRarityTags ?? this.selRarityTags,
+      selElementTags: selElementTags ?? this.selElementTags,
+      selWeaponTags: selWeaponTags ?? this.selWeaponTags,
+      allItems: allItems ?? this.allItems,
+      viewItems: viewItems ?? this.viewItems,
+    );
+  }
+}
+
+class GwSearchController extends ChangeNotifier {
+  GwSearchController({SearchRepository? repo})
+    : _repo = repo ?? SearchRepository();
+
+  final SearchRepository _repo;
+  SearchState _s = SearchState.initial();
+  SearchState get state => _s;
+
+  int _token = 0;
+
+  // ✅ WPの実slug（君のスクショの通り）
+  static const String _genshinCategorySlug = 'genshin-impact';
+  static const String _tekkenCategorySlug = 'tekken7';
+
+  Future<void> boot() async {
+    final token = ++_token;
+    _set(_s.copyWith(loading: true, error: null, taxonomyReady: false));
+
+    try {
+      final tax = await _repo.resolveTaxonomy(
+        token: token,
+        genshinCategorySlug: _genshinCategorySlug,
+        tekkenCategorySlug: _tekkenCategorySlug,
+      );
+      if (token != _token) return;
+
+      _set(
+        _s.copyWith(
+          taxonomyReady: true,
+          genshinCategoryId: tax.genshinCategoryId,
+          tekkenCategoryId: tax.tekkenCategoryId,
+          rarityTagId: tax.rarityTagId,
+          elementTagId: tax.elementTagId,
+          weaponTagId: tax.weaponTagId,
+        ),
+      );
+
+      final all = await _repo.loadAllPosts();
+      if (token != _token) return;
+
+      final sorted = [...all]..sort((a, b) => b.date.compareTo(a.date));
+      _set(_s.copyWith(allItems: sorted));
+      _applyView();
+    } catch (e) {
+      if (token != _token) return;
+      _set(_s.copyWith(error: 'Boot failed: $e'));
+    } finally {
+      if (token != _token) return;
+      _set(_s.copyWith(loading: false));
+    }
+  }
+
+  Future<void> refresh() async {
+    final token = ++_token;
+    _set(_s.copyWith(loading: true, error: null));
+    try {
+      final all = await _repo.loadAllPosts();
+      if (token != _token) return;
+      final sorted = [...all]..sort((a, b) => b.date.compareTo(a.date));
+      _set(_s.copyWith(allItems: sorted));
+      _applyView();
+    } catch (e) {
+      if (token != _token) return;
+      _set(_s.copyWith(error: 'Reload failed: $e'));
+    } finally {
+      if (token != _token) return;
+      _set(_s.copyWith(loading: false));
+    }
+  }
+
+  void switchTab(SearchTab tab) {
+    if (tab == _s.tab) return;
+
+    // genshin以外はフィルター解除
+    var ns = _s.copyWith(tab: tab, error: null, query: '');
+    if (tab != SearchTab.genshin) {
+      ns = ns.copyWith(
+        selRarityTags: <int>{},
+        selElementTags: <int>{},
+        selWeaponTags: <int>{},
+      );
+    }
+    _set(ns);
+    _applyView();
+  }
+
+  void setQuery(String q) {
+    _set(_s.copyWith(query: q));
+    _applyView();
+  }
+
+  void clearQuery() {
+    _set(_s.copyWith(query: ''));
+    _applyView();
+  }
+
+  void resetFilters() {
+    _set(
+      _s.copyWith(
+        selRarityTags: <int>{},
+        selElementTags: <int>{},
+        selWeaponTags: <int>{},
+      ),
+    );
+    _applyView();
+  }
+
+  void toggleRarity(int tagId) => _toggle(
+    _s.selRarityTags,
+    tagId,
+    (v) => _set(_s.copyWith(selRarityTags: v)),
+  );
+  void toggleElement(int tagId) => _toggle(
+    _s.selElementTags,
+    tagId,
+    (v) => _set(_s.copyWith(selElementTags: v)),
+  );
+  void toggleWeapon(int tagId) => _toggle(
+    _s.selWeaponTags,
+    tagId,
+    (v) => _set(_s.copyWith(selWeaponTags: v)),
+  );
+
+  void _toggle(Set<int> cur, int tagId, void Function(Set<int>) commit) {
+    if (tagId == 0) return;
+    final next = {...cur};
+    if (next.contains(tagId)) {
+      next.remove(tagId);
+    } else {
+      next.add(tagId);
+    }
+    commit(next);
+    _applyView();
+  }
+
+  void _applyView() {
+    var out = [..._s.allItems];
+
+    // ✅ 1) タブ絞り込み（カテゴリが効けばカテゴリ、効かなければlink/baseで救う）
+    if (_s.tab == SearchTab.genshin) {
+      final cat = _s.genshinCategoryId;
+      if (cat != 0) {
+        out = out
+            .where((x) => x.categoryIds.contains(cat) || x.isGenshin)
+            .toList();
+      } else {
+        out = out.where((x) => x.isGenshin).toList();
+      }
+    } else if (_s.tab == SearchTab.tekken) {
+      final cat = _s.tekkenCategoryId;
+      if (cat != 0) {
+        out = out
+            .where((x) => x.categoryIds.contains(cat) || x.isTekken)
+            .toList();
+      } else {
+        out = out.where((x) => x.isTekken).toList();
+      }
+    }
+
+    // ✅ 2) ローカル検索
+    final q = _s.query.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      out = out.where((x) => x.name.toLowerCase().contains(q)).toList();
+    }
+
+    // ✅ 3) フィルター（genshinだけ）
+    if (_s.tab == SearchTab.genshin) {
+      if (_s.selRarityTags.isNotEmpty) {
+        out = out
+            .where((x) => x.tagIds.any(_s.selRarityTags.contains))
+            .toList();
+      }
+      if (_s.selElementTags.isNotEmpty) {
+        out = out
+            .where((x) => x.tagIds.any(_s.selElementTags.contains))
+            .toList();
+      }
+      if (_s.selWeaponTags.isNotEmpty) {
+        out = out
+            .where((x) => x.tagIds.any(_s.selWeaponTags.contains))
+            .toList();
+      }
+    }
+
+    out.sort((a, b) => b.date.compareTo(a.date));
+    _set(_s.copyWith(viewItems: out));
+  }
+
+  void _set(SearchState next) {
+    _s = next;
+    notifyListeners();
+  }
+
+  void disposeController() {
+    // no-op (互換)
+  }
+}

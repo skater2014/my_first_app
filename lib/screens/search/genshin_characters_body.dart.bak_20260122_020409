@@ -1,0 +1,203 @@
+import 'dart:convert';
+
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+
+class GenshinCharactersBody extends StatefulWidget {
+  const GenshinCharactersBody({
+    super.key,
+    required this.nameQuery,
+  });
+
+  /// SearchScreen の上の検索欄を “キャラ名フィルタ” として流用
+  final String nameQuery;
+
+  @override
+  State<GenshinCharactersBody> createState() => _GenshinCharactersBodyState();
+}
+
+class _GenshinCharactersBodyState extends State<GenshinCharactersBody> {
+  static const String _endpoint =
+      'https://gamewidth.net/wp-json/gwc/v1/characters?lang=ja&full=false';
+
+  late Future<List<GenshinChar>> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = _fetch();
+  }
+
+  Future<List<GenshinChar>> _fetch() async {
+    final res = await http.get(Uri.parse(_endpoint));
+    if (res.statusCode != 200) {
+      throw Exception('API error: ${res.statusCode}');
+    }
+    final data = jsonDecode(res.body);
+    final list = (data is List) ? data : (data['items'] as List? ?? []);
+    return list.map((e) => GenshinChar.fromJson(e)).toList();
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _future = _fetch());
+    await _future;
+  }
+
+  List<GenshinChar> _applyName(List<GenshinChar> all) {
+    final q = widget.nameQuery.trim().toLowerCase();
+    if (q.isEmpty) return all;
+    return all.where((c) => c.name.toLowerCase().contains(q)).toList();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RefreshIndicator(
+      onRefresh: _refresh,
+      child: FutureBuilder<List<GenshinChar>>(
+        future: _future,
+        builder: (context, snap) {
+          if (snap.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snap.hasError) {
+            return ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              children: [
+                const SizedBox(height: 120),
+                Center(child: Text('Error: ${snap.error}')),
+                const SizedBox(height: 12),
+                Center(
+                  child: FilledButton(
+                    onPressed: _refresh,
+                    child: const Text('Retry'),
+                  ),
+                ),
+              ],
+            );
+          }
+
+          final all = snap.data ?? [];
+          final view = _applyName(all);
+
+          if (view.isEmpty) {
+            return ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              children: const [
+                SizedBox(height: 120),
+                Center(child: Text('No characters')),
+              ],
+            );
+          }
+
+          return GridView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 3, // ✅ 3カラム
+              crossAxisSpacing: 10,
+              mainAxisSpacing: 10,
+              childAspectRatio: 1, // ✅ 正方形（アイコンだけ）
+            ),
+            itemCount: view.length,
+            itemBuilder: (context, i) {
+              final c = view[i];
+              return _IconTile(
+                name: c.name,
+                iconUrl: c.iconUrl,
+                onTap: () {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('tap: ${c.name} (id=${c.id})')),
+                  );
+                },
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class GenshinChar {
+  final int id;
+  final String name;
+  final String? iconUrl;
+
+  const GenshinChar({
+    required this.id,
+    required this.name,
+    required this.iconUrl,
+  });
+
+  factory GenshinChar.fromJson(Map<String, dynamic> j) {
+    int toInt(dynamic v) {
+      if (v == null) return 0;
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      if (v is String) return int.tryParse(v) ?? 0;
+      return 0;
+    }
+
+    String toStr(dynamic v) => (v == null) ? '' : v.toString();
+
+    return GenshinChar(
+      id: toInt(j['id']),
+      name: toStr(j['name'] ?? j['title']),
+      iconUrl: (j['icon'] ?? j['thumb'] ?? j['image'])?.toString(),
+    );
+  }
+}
+
+class _IconTile extends StatelessWidget {
+  const _IconTile({
+    required this.name,
+    required this.iconUrl,
+    required this.onTap,
+  });
+
+  final String name;
+  final String? iconUrl;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final url = (iconUrl ?? '').trim();
+
+    return Material(
+      color: cs.surface,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: Theme.of(context).dividerColor),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Tooltip(
+          message: name,
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                color: cs.surfaceVariant,
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: url.isEmpty
+                  ? Icon(Icons.person, color: cs.onSurfaceVariant)
+                  : CachedNetworkImage(
+                      imageUrl: url,
+                      fit: BoxFit.cover,
+                      placeholder: (_, __) =>
+                          const ColoredBox(color: Colors.black12),
+                      errorWidget: (_, __, ___) =>
+                          Icon(Icons.broken_image, color: cs.onSurfaceVariant),
+                    ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

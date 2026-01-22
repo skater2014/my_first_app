@@ -1,0 +1,1046 @@
+// lib/screens/search_screen.dart
+//
+// ==========================================================
+// ✅ 目的：WP REST API（wp/v2）だけで “全部の投稿をまとめて” ギャラリー表示
+// ==========================================================
+//
+// ✅ これでやること（お前の要求どおり）
+// - 「posts だけ」じゃなくて、rest_base に書いたやつ全部を叩く
+//   例：posts / gu / genshin_updated / artifacts / gu-jp / ...（存在しないのは無視）
+// - 取得した投稿を “1つの配列に合体” → date 降順でソート → ギャラリー表示
+// - Genshin / Tekken タブは “カテゴリ slug” でフィルタ（ID直書き禁止）
+// - レア/元素/武器は “タグ slug” でIDを起動時に解決（ID直書き禁止）
+// - つまり「ここだけID合わせろ」みたいなクソ実装は全部消す
+//
+// ✅ 依存
+// - http
+// - cached_network_image
+//
+// ⚠️注意
+// - WP側で CPT が show_in_rest=true になってないと /wp/v2/{rest_base} は取れない
+// - タグ/カテゴリも WP側で REST に出てる前提（通常は出る）
+// ==========================================================
+
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:http/http.dart' as http;
+
+import '../constants.dart'; // ✅ wpV2BaseUrl がある前提（例: https://gamewidth.net/wp-json/wp/v2）
+
+class SearchScreen extends StatefulWidget {
+  const SearchScreen({super.key});
+
+  @override
+  State<SearchScreen> createState() => _SearchScreenState();
+}
+
+/// ✅ タブ（All=全部 / Genshin / Tekken）
+enum _CategoryTab { all, genshin, tekken }
+
+class _SearchScreenState extends State<SearchScreen> {
+  // ==========================================================
+  // ✅ 1) 叩くREST base（お前が言ってた「全部」）
+  // ==========================================================
+  //
+  // ここが “wp/v2/{base}” の {base}
+  // 例：/wp-json/wp/v2/posts
+  //     /wp-json/wp/v2/gu
+  //
+  // ✅ EN/JA 両方を混ぜたいなら両方入れろ（ここでは全部入れてる）
+  static const List<String> _restBasesAll = <String>[
+    'posts', // WP標準投稿
+    'gu', // CPT(EN)
+    'genshin_updated', // 旧/別名候補
+    'artifacts', // 例：別CPT
+    'gu-jp', // CPT(JP)
+    'genshin_updated_jp', // JP候補
+  ];
+
+  // ==========================================================
+  // ✅ 2) Genshin / Tekken のカテゴリは “slug” だけ決める
+  // ==========================================================
+  static const String _genshinCategorySlug = 'genshin';
+  static const String _tekkenCategorySlug = 'tekken';
+
+  // ==========================================================
+  // ✅ 3) フィルターは “タグ slug” を定義する（ID直書き禁止）
+  // ==========================================================
+  //
+  // 表示ラベル -> slug（WPの実際のslugに合わせろ）
+  static const Map<String, String> _rarityTagSlug = {
+    '★5': 'rarity-5',
+    '★4': 'rarity-4',
+  };
+
+  static const Map<String, String> _elementTagSlug = {
+    'pyro': 'pyro',
+    'hydro': 'hydro',
+    'anemo': 'anemo',
+    'electro': 'electro',
+    'dendro': 'dendro',
+    'cryo': 'cryo',
+    'geo': 'geo',
+  };
+
+  static const Map<String, String> _weaponTagSlug = {
+    'sword': 'sword',
+    'claymore': 'claymore',
+    'polearm': 'polearm',
+    'bow': 'bow',
+    'catalyst': 'catalyst',
+  };
+
+  // ==========================================================
+  // ✅ HTTP（使い回し）
+  // ==========================================================
+  static final http.Client _client = http.Client();
+
+  // ==========================================================
+  // ✅ UI state
+  // ==========================================================
+  final _textController = TextEditingController();
+  final _debouncer = _Debouncer(const Duration(milliseconds: 250));
+
+  bool _loading = false;
+  String? _error;
+
+  _CategoryTab _tab = _CategoryTab.all;
+  String _query = '';
+
+  // ==========================================================
+  // ✅ taxonomy（slug -> id）解決結果
+  // ==========================================================
+  bool _taxonomyReady = false;
+
+  int _genshinCategoryId = 0;
+  int _tekkenCategoryId = 0;
+
+  // 表示ラベル -> tagId（起動時に解決）
+  Map<String, int> _rarityTagId = const {};
+  Map<String, int> _elementTagId = const {};
+  Map<String, int> _weaponTagId = const {};
+
+  // ==========================================================
+  // ✅ data
+  // ==========================================================
+  //
+  // まず “全部の投稿” を 1 回だけ取って、タブ/検索/フィルターは全部ローカルで処理する。
+  // （毎回API叩くと遅い・面倒・不安定）
+  final List<_CardPost> _allItems = <_CardPost>[];
+
+  // 表示用（タブ/検索/フィルタ適用後）
+  List<_CardPost> _view = <_CardPost>[];
+
+  // filters（Genshinだけ）
+  final Set<int> _selRarityTags = <int>{};
+  final Set<int> _selElementTags = <int>{};
+  final Set<int> _selWeaponTags = <int>{};
+
+  // 非同期ガード（古いレスポンスを捨てる）
+  int _token = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _boot();
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    _debouncer.dispose();
+    super.dispose();
+  }
+
+  // ==========================================================
+  // ✅ 起動：taxonomy解決 → 全投稿ロード
+  // ==========================================================
+  Future<void> _boot() async {
+    final token = ++_token;
+
+    setState(() {
+      _loading = true;
+      _error = null;
+      _taxonomyReady = false;
+    });
+
+    try {
+      // 1) taxonomy 解決（slug -> id）
+      await _initTaxonomy(token);
+
+      // 2) 全投稿ロード（rest base 全部）
+      await _loadAllPosts(token);
+
+      if (!mounted || token != _token) return;
+
+      setState(() {
+        _taxonomyReady = true;
+      });
+
+      // 3) 初期表示反映
+      _applyView();
+    } catch (e) {
+      if (!mounted || token != _token) return;
+      setState(() => _error = 'Boot failed: $e');
+    } finally {
+      if (!mounted || token != _token) return;
+      setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _initTaxonomy(int token) async {
+    // ✅ カテゴリID（slug -> id）
+    _genshinCategoryId = await _fetchTermIdBySlug(
+      taxonomy: 'categories',
+      slug: _genshinCategorySlug,
+      token: token,
+    );
+    _tekkenCategoryId = await _fetchTermIdBySlug(
+      taxonomy: 'categories',
+      slug: _tekkenCategorySlug,
+      token: token,
+    );
+
+    // ✅ タグID（slug -> id）
+    _rarityTagId = await _fetchTagIdsBySlugs(_rarityTagSlug, token: token);
+    _elementTagId = await _fetchTagIdsBySlugs(_elementTagSlug, token: token);
+    _weaponTagId = await _fetchTagIdsBySlugs(_weaponTagSlug, token: token);
+  }
+
+  // ==========================================================
+  // ✅ “全部の投稿” を rest_base 全部から集める
+  // ==========================================================
+  //
+  // - posts は古い記事が落ちやすいので複数ページ回す（最大3ページ=300件）
+  // - 他のbaseは軽量に1ページだけ
+  Future<void> _loadAllPosts(int token) async {
+    _allItems.clear();
+
+    // 1) posts は複数ページ（古い記事対策）
+    final posts = await _fetchPostsMultiPages(
+      base: 'posts',
+      perPage: 100,
+      maxPages: 3,
+      token: token,
+    );
+    _allItems.addAll(posts);
+
+    // 2) その他base（1ページだけ）
+    for (final b in _restBasesAll) {
+      if (b == 'posts') continue;
+      final one = await _fetchPostsOnePage(
+        base: b,
+        perPage: 100,
+        page: 1,
+        token: token,
+      );
+      _allItems.addAll(one);
+    }
+
+    // 3) 重複排除（id）
+    final seen = <int>{};
+    final unique = <_CardPost>[];
+    for (final p in _allItems) {
+      if (seen.add(p.id)) unique.add(p);
+    }
+
+    // 4) 新しい順（date desc）
+    unique.sort((a, b) => b.date.compareTo(a.date));
+
+    _allItems
+      ..clear()
+      ..addAll(unique);
+  }
+
+  Future<List<_CardPost>> _fetchPostsMultiPages({
+    required String base,
+    required int perPage,
+    required int maxPages,
+    required int token,
+  }) async {
+    final out = <_CardPost>[];
+    for (int page = 1; page <= maxPages; page++) {
+      final one = await _fetchPostsOnePage(
+        base: base,
+        perPage: perPage,
+        page: page,
+        token: token,
+      );
+      if (one.isEmpty) break;
+      out.addAll(one);
+      if (one.length < perPage) break;
+    }
+    return out;
+  }
+
+  Future<List<_CardPost>> _fetchPostsOnePage({
+    required String base,
+    required int perPage,
+    required int page,
+    required int token,
+  }) async {
+    // ✅ baseごとに 404 になっても “空で返す”（全部入りで落とさない）
+    try {
+      final uri = Uri.parse('$wpV2BaseUrl/$base').replace(
+        queryParameters: <String, String>{
+          'per_page': '$perPage',
+          'page': '$page',
+          '_embed': '1', // ✅ featured image を _embedded に入れる
+          'orderby': 'date',
+          'order': 'desc',
+        },
+      );
+
+      final res = await _client.get(
+        uri,
+        headers: const <String, String>{'accept': 'application/json'},
+      );
+
+      if (!mounted || token != _token) return const <_CardPost>[];
+
+      // 404 / 401 / 500 などは “このbaseは無い/取れない” 扱いで無視
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        return const <_CardPost>[];
+      }
+
+      final decoded = jsonDecode(res.body);
+      if (decoded is! List) return const <_CardPost>[];
+
+      return decoded
+          .map((e) => _CardPost.fromWpPostJson(e, base: base))
+          .where((x) => x.id != 0 && x.name.isNotEmpty)
+          .toList();
+    } catch (_) {
+      return const <_CardPost>[];
+    }
+  }
+
+  // ==========================================================
+  // ✅ taxonomy: slug -> id
+  // ==========================================================
+  //
+  // GET /wp-json/wp/v2/categories?slug=genshin
+  // GET /wp-json/wp/v2/tags?slug=rarity-5
+  Future<int> _fetchTermIdBySlug({
+    required String taxonomy, // 'categories' or 'tags'
+    required String slug,
+    required int token,
+  }) async {
+    final s = slug.trim();
+    if (s.isEmpty) return 0;
+
+    final uri = Uri.parse(
+      '$wpV2BaseUrl/$taxonomy',
+    ).replace(queryParameters: <String, String>{'slug': s, 'per_page': '100'});
+
+    final res = await _client.get(
+      uri,
+      headers: const <String, String>{'accept': 'application/json'},
+    );
+
+    if (!mounted || token != _token) return 0;
+    if (res.statusCode < 200 || res.statusCode >= 300) return 0;
+
+    final decoded = jsonDecode(res.body);
+    if (decoded is! List || decoded.isEmpty) return 0;
+
+    final first = decoded.first;
+    if (first is Map && first['id'] != null) {
+      final v = first['id'];
+      if (v is int) return v;
+      return int.tryParse('$v') ?? 0;
+    }
+    return 0;
+  }
+
+  Future<Map<String, int>> _fetchTagIdsBySlugs(
+    Map<String, String> labelToSlug, {
+    required int token,
+  }) async {
+    final out = <String, int>{};
+    for (final e in labelToSlug.entries) {
+      final id = await _fetchTermIdBySlug(
+        taxonomy: 'tags',
+        slug: e.value,
+        token: token,
+      );
+      if (!mounted || token != _token) return const <String, int>{};
+      if (id != 0) out[e.key] = id; // ✅ 見つかったものだけ入れる
+    }
+    return out;
+  }
+
+  // ==========================================================
+  // ✅ UI handlers
+  // ==========================================================
+  Future<void> _onRefresh() async {
+    final token = ++_token;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      await _loadAllPosts(token);
+      if (!mounted || token != _token) return;
+      _applyView();
+    } catch (e) {
+      if (!mounted || token != _token) return;
+      setState(() => _error = 'Reload failed: $e');
+    } finally {
+      if (!mounted || token != _token) return;
+      setState(() => _loading = false);
+    }
+  }
+
+  void _onChange(String text) {
+    setState(() => _query = text);
+    _debouncer.run(_applyView);
+  }
+
+  void _switchTab(_CategoryTab next) {
+    if (next == _tab) return;
+
+    setState(() {
+      _tab = next;
+      _error = null;
+      _query = '';
+    });
+    _textController.clear();
+
+    // Tekken/All はフィルター不要（消す）
+    if (next != _CategoryTab.genshin) {
+      _selRarityTags.clear();
+      _selElementTags.clear();
+      _selWeaponTags.clear();
+    }
+
+    _applyView();
+  }
+
+  void _resetFilters() {
+    _selRarityTags.clear();
+    _selElementTags.clear();
+    _selWeaponTags.clear();
+    _applyView();
+  }
+
+  void _toggleTag(Set<int> set, int tagId) {
+    if (tagId == 0) return; // 解決できてないなら無視
+    if (set.contains(tagId)) {
+      set.remove(tagId);
+    } else {
+      set.add(tagId);
+    }
+    _applyView();
+  }
+
+  // ==========================================================
+  // ✅ “表示配列” を作る（ローカル検索＆フィルター）
+  // ==========================================================
+  void _applyView() {
+    var out = List<_CardPost>.from(_allItems);
+
+    // 1) タブ（カテゴリで絞る）
+    if (_tab == _CategoryTab.genshin && _genshinCategoryId != 0) {
+      out = out
+          .where((x) => x.categoryIds.contains(_genshinCategoryId))
+          .toList();
+    } else if (_tab == _CategoryTab.tekken && _tekkenCategoryId != 0) {
+      out = out
+          .where((x) => x.categoryIds.contains(_tekkenCategoryId))
+          .toList();
+    } // All は絞らない
+
+    // 2) 検索（タイトルのローカルフィルタ）
+    final q = _query.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      out = out.where((x) => x.name.toLowerCase().contains(q)).toList();
+    }
+
+    // 3) フィルター（Genshinだけ）
+    if (_tab == _CategoryTab.genshin) {
+      if (_selRarityTags.isNotEmpty) {
+        out = out.where((x) => x.hasAnyTag(_selRarityTags)).toList();
+      }
+      if (_selElementTags.isNotEmpty) {
+        out = out.where((x) => x.hasAnyTag(_selElementTags)).toList();
+      }
+      if (_selWeaponTags.isNotEmpty) {
+        out = out.where((x) => x.hasAnyTag(_selWeaponTags)).toList();
+      }
+    }
+
+    // 4) date desc
+    out.sort((a, b) => b.date.compareTo(a.date));
+
+    setState(() => _view = out);
+  }
+
+  // ==========================================================
+  // ✅ UI
+  // ==========================================================
+  @override
+  Widget build(BuildContext context) {
+    final title = switch (_tab) {
+      _CategoryTab.all => 'All',
+      _CategoryTab.genshin => 'Genshin',
+      _CategoryTab.tekken => 'Tekken',
+    };
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title),
+        actions: [
+          // ✅ Genshinだけフィルタークリア
+          if (_tab == _CategoryTab.genshin)
+            IconButton(
+              tooltip: 'Clear filters',
+              onPressed: _resetFilters,
+              icon: const Icon(Icons.filter_alt_off),
+            ),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            // Search（常に表示）
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+              child: TextField(
+                controller: _textController,
+                onChanged: _onChange,
+                textInputAction: TextInputAction.search,
+                decoration: InputDecoration(
+                  prefixIcon: const Icon(Icons.search),
+                  hintText: 'Search (local filter)',
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  isDense: true,
+                  suffixIcon: _textController.text.isEmpty
+                      ? null
+                      : IconButton(
+                          icon: const Icon(Icons.clear),
+                          onPressed: () {
+                            _textController.clear();
+                            setState(() => _query = '');
+                            _applyView();
+                          },
+                        ),
+                ),
+              ),
+            ),
+
+            // Tabs（検索の真下）
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: SegmentedButton<_CategoryTab>(
+                segments: const [
+                  ButtonSegment(value: _CategoryTab.all, label: Text('All')),
+                  ButtonSegment(
+                    value: _CategoryTab.genshin,
+                    label: Text('Genshin'),
+                  ),
+                  ButtonSegment(
+                    value: _CategoryTab.tekken,
+                    label: Text('Tekken'),
+                  ),
+                ],
+                selected: {_tab},
+                onSelectionChanged: (s) => _switchTab(s.first),
+              ),
+            ),
+
+            // ✅ taxonomy がまだなら注意表示（落とさない）
+            if (!_taxonomyReady)
+              const Padding(
+                padding: EdgeInsets.fromLTRB(12, 0, 12, 10),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text('Resolving taxonomy (slug → id)...'),
+                ),
+              ),
+
+            // Filters（Genshinだけ、taxonomyが取れてるときだけ）
+            if (_tab == _CategoryTab.genshin && _taxonomyReady) _filters(),
+
+            // Gallery Grid
+            Expanded(
+              child: RefreshIndicator(
+                onRefresh: _onRefresh,
+                child: _buildBody(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _filters() {
+    // ✅ タグIDが解決できてない場合はフィルターを出しても意味がないので抑制
+    final hasAnyTag =
+        _rarityTagId.isNotEmpty ||
+        _elementTagId.isNotEmpty ||
+        _weaponTagId.isNotEmpty;
+
+    if (!hasAnyTag) {
+      return const Padding(
+        padding: EdgeInsets.fromLTRB(12, 0, 12, 10),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Text('No tag IDs resolved. Check your tag slugs in WP.'),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Rarity
+          if (_rarityTagId.isNotEmpty) ...[
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                const _LabelChip(text: 'Rarity'),
+                for (final entry in _rarityTagId.entries)
+                  FilterChip(
+                    selected: _selRarityTags.contains(entry.value),
+                    label: Text(entry.key),
+                    onSelected: (_) => _toggleTag(_selRarityTags, entry.value),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+          ],
+
+          // Element
+          if (_elementTagId.isNotEmpty) ...[
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                const _LabelChip(text: 'Element'),
+                for (final entry in _elementTagId.entries)
+                  FilterChip(
+                    selected: _selElementTags.contains(entry.value),
+                    label: Text(entry.key),
+                    onSelected: (_) => _toggleTag(_selElementTags, entry.value),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+          ],
+
+          // Weapon
+          if (_weaponTagId.isNotEmpty) ...[
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                const _LabelChip(text: 'Weapon'),
+                for (final entry in _weaponTagId.entries)
+                  FilterChip(
+                    selected: _selWeaponTags.contains(entry.value),
+                    label: Text(entry.key),
+                    onSelected: (_) => _toggleTag(_selWeaponTags, entry.value),
+                  ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBody() {
+    // 初回ロード
+    if (_loading && _allItems.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    // 初回エラー
+    if (_error != null && _allItems.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          const SizedBox(height: 120),
+          Center(child: Text(_error!)),
+          const SizedBox(height: 12),
+          Center(
+            child: FilledButton(onPressed: _boot, child: const Text('Retry')),
+          ),
+        ],
+      );
+    }
+
+    // 結果なし（検索/フィルター）
+    if (_view.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: const [
+          SizedBox(height: 120),
+          Center(child: Text('No results')),
+        ],
+      );
+    }
+
+    return Stack(
+      children: [
+        GridView.builder(
+          padding: const EdgeInsets.fromLTRB(8, 8, 8, 16),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 3,
+            mainAxisSpacing: 10,
+            crossAxisSpacing: 10,
+            childAspectRatio: 0.82,
+          ),
+          itemCount: _view.length,
+          itemBuilder: (context, i) {
+            final item = _view[i];
+
+            return InkWell(
+              onTap: () {
+                // ✅ ここをお前の本物の詳細画面へ差し替えろ
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => _PostStubDetailScreen(item: item),
+                  ),
+                );
+              },
+              child: Column(
+                children: [
+                  Expanded(
+                    child: Stack(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Container(
+                            color: Colors.black12,
+                            child: item.thumbUrl == null
+                                ? const Center(
+                                    child: Icon(
+                                      Icons.image_not_supported_outlined,
+                                      color: Colors.white54,
+                                    ),
+                                  )
+                                : CachedNetworkImage(
+                                    imageUrl: item.thumbUrl!,
+                                    fit: BoxFit.cover,
+                                    width: double.infinity,
+                                    height: double.infinity,
+                                    placeholder: (_, __) =>
+                                        Container(color: Colors.black12),
+                                    errorWidget: (_, __, ___) => Container(
+                                      color: Colors.black12,
+                                      child: const Center(
+                                        child: Icon(
+                                          Icons.broken_image_outlined,
+                                          color: Colors.white54,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                          ),
+                        ),
+
+                        // ✅ Genshinだけバッジ（タグの有無を雑に表示）
+                        if (_tab == _CategoryTab.genshin)
+                          Positioned(
+                            top: 6,
+                            right: 6,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withOpacity(0.35),
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: Text(
+                                item.tagBadgeText(
+                                  rarity: _rarityTagId,
+                                  element: _elementTagId,
+                                  weapon: _weaponTagId,
+                                ),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 11,
+                                  height: 1.0,
+                                ),
+                              ),
+                            ),
+                          ),
+
+                        // ✅ どのbaseから来たか（デバッグ用：いらなきゃ消せ）
+                        Positioned(
+                          left: 6,
+                          bottom: 6,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withOpacity(0.28),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Text(
+                              item.base,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 10,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    item.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+
+        // 取得中（既に表示あり）
+        if (_loading && _allItems.isNotEmpty)
+          Positioned(
+            top: 10,
+            right: 10,
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.08),
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+// ==========================================================
+// ✅ WP v2 post JSON → Gallery card 用モデル（必要最低限）
+// ==========================================================
+//
+// - id
+// - title.rendered
+// - date
+// - categories: [int]
+// - tags: [int]
+// - featured image: _embedded['wp:featuredmedia'][0]['source_url']
+// ==========================================================
+class _CardPost {
+  final int id;
+  final String base; // ✅ どのrest_baseから来たか（デバッグ用）
+  final String name;
+  final DateTime date;
+  final String? thumbUrl;
+  final Set<int> tagIds;
+  final Set<int> categoryIds;
+
+  const _CardPost({
+    required this.id,
+    required this.base,
+    required this.name,
+    required this.date,
+    required this.thumbUrl,
+    required this.tagIds,
+    required this.categoryIds,
+  });
+
+  bool hasAnyTag(Set<int> sel) => tagIds.any(sel.contains);
+
+  String tagBadgeText({
+    required Map<String, int> rarity,
+    required Map<String, int> element,
+    required Map<String, int> weapon,
+  }) {
+    String? find(Map<String, int> m) {
+      for (final e in m.entries) {
+        if (tagIds.contains(e.value)) return e.key;
+      }
+      return null;
+    }
+
+    final parts = <String>[];
+    final r = find(rarity);
+    final el = find(element);
+    final w = find(weapon);
+
+    if (r != null) parts.add(r);
+    if (el != null) parts.add(el);
+    if (w != null) parts.add(w);
+
+    return parts.isEmpty ? 'CHAR' : parts.join(' ');
+  }
+
+  static String _stripHtml(String s) =>
+      s.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+
+  static DateTime _parseDate(dynamic v) {
+    if (v == null) return DateTime.fromMillisecondsSinceEpoch(0);
+    if (v is String)
+      return DateTime.tryParse(v) ?? DateTime.fromMillisecondsSinceEpoch(0);
+    return DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  static Set<int> _toIntSet(dynamic v) {
+    final out = <int>{};
+    if (v is List) {
+      for (final x in v) {
+        final n = (x is int) ? x : int.tryParse('$x');
+        if (n != null) out.add(n);
+      }
+    }
+    return out;
+  }
+
+  factory _CardPost.fromWpPostJson(dynamic json, {required String base}) {
+    final Map<String, dynamic> m = (json is Map<String, dynamic>)
+        ? json
+        : <String, dynamic>{};
+
+    final id = (m['id'] is int)
+        ? m['id'] as int
+        : int.tryParse('${m['id']}') ?? 0;
+
+    // title.rendered
+    String title = '';
+    final t = m['title'];
+    if (t is Map && t['rendered'] != null) {
+      title = '${t['rendered']}';
+    } else {
+      title = '${m['title'] ?? ''}';
+    }
+    final name = _stripHtml(title);
+
+    // date
+    final date = _parseDate(m['date']);
+
+    // tags / categories
+    final tagIds = _toIntSet(m['tags']);
+    final categoryIds = _toIntSet(m['categories']);
+
+    // featured image via _embedded
+    String? thumb;
+    final emb = m['_embedded'];
+    if (emb is Map && emb['wp:featuredmedia'] is List) {
+      final List fm = emb['wp:featuredmedia'];
+      if (fm.isNotEmpty && fm.first is Map) {
+        final Map f0 = fm.first as Map;
+        final src = f0['source_url']?.toString();
+        if (src != null && src.trim().isNotEmpty) thumb = src.trim();
+      }
+    }
+
+    // avif回避（必要なら）
+    if (thumb != null) {
+      final lower = thumb!.toLowerCase().split('?').first;
+      if (lower.endsWith('.avif')) thumb = null;
+    }
+
+    return _CardPost(
+      id: id,
+      base: base,
+      name: name,
+      date: date,
+      thumbUrl: thumb,
+      tagIds: tagIds,
+      categoryIds: categoryIds,
+    );
+  }
+}
+
+class _LabelChip extends StatelessWidget {
+  final String text;
+  const _LabelChip({required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return Chip(label: Text(text), visualDensity: VisualDensity.compact);
+  }
+}
+
+// 仮詳細（差し替え）
+class _PostStubDetailScreen extends StatelessWidget {
+  final _CardPost item;
+  const _PostStubDetailScreen({required this.item});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(item.name)),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            if (item.thumbUrl != null)
+              ClipRRect(
+                borderRadius: BorderRadius.circular(16),
+                child: CachedNetworkImage(
+                  imageUrl: item.thumbUrl!,
+                  width: 220,
+                  height: 220,
+                  fit: BoxFit.cover,
+                ),
+              ),
+            const SizedBox(height: 16),
+            Text('Post ID: ${item.id}'),
+            Text('Base: ${item.base}'),
+            Text('Date: ${item.date.toIso8601String()}'),
+            Text('Categories: ${item.categoryIds.join(", ")}'),
+            Text('Tags: ${item.tagIds.join(", ")}'),
+            const SizedBox(height: 20),
+            const Text(
+              'ここは仮詳細。\nお前の “本物の詳細画面” に差し替えろ。',
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _Debouncer {
+  final Duration delay;
+  Timer? _timer;
+
+  _Debouncer(this.delay);
+
+  void run(void Function() action) {
+    _timer?.cancel();
+    _timer = Timer(delay, action);
+  }
+
+  void dispose() {
+    _timer?.cancel();
+  }
+}

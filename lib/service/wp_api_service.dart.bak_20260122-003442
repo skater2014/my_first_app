@@ -1,0 +1,373 @@
+// lib/service/wp_api_service.dart
+import 'dart:convert';
+import 'dart:math';
+
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../constants.dart';
+import '../model/post.dart';
+import '../model/comment.dart';
+import '../model/banner.dart';
+
+class WpApiService {
+  final http.Client _client;
+
+  WpApiService({http.Client? client}) : _client = client ?? http.Client();
+
+  // ✅ 横断対象（WP REST の rest_base）
+  static const List<String> _restBases = [
+    'posts',
+    'gu',
+    'gu-jp',
+    'genshin_updated',
+    'genshin_updated_jp',
+    'artifacts',
+  ];
+
+  // ✅ 共通ヘッダ（WP側で弾かれる時の保険にもなる）
+  static const Map<String, String> _headers = {'Accept': 'application/json'};
+
+  // ✅ 共通GET（timeout付き）
+  Future<http.Response> _get(Uri uri) {
+    return _client
+        .get(uri, headers: _headers)
+        .timeout(const Duration(seconds: 15));
+  }
+
+  // ==========================================================
+  // ✅ ここが本体：特定のREST baseから投稿を取る
+  // ==========================================================
+  Future<List<Post>> _fetchPostsFromBase(
+    String base, {
+    required int perPage,
+    int page = 1,
+    String? searchQuery,
+  }) async {
+    try {
+      final qp = <String>['_embed=1', 'per_page=$perPage', 'page=$page'];
+
+      if (searchQuery != null && searchQuery.trim().isNotEmpty) {
+        final q = Uri.encodeQueryComponent(searchQuery.trim());
+        qp.add('search=$q');
+      }
+
+      final uri = Uri.parse('$wpBaseUrl/$base?${qp.join("&")}');
+
+      // ✅ 何を叩いてるか
+      print('[WP] GET => $uri');
+
+      final res = await _get(uri);
+
+      // ✅ status とサイズ
+      print(
+        '[WP] status=${res.statusCode} bytes=${res.bodyBytes.length} base=$base',
+      );
+
+      if (res.statusCode != 200) {
+        final head = res.body.isNotEmpty
+            ? res.body.substring(
+                0,
+                res.body.length > 200 ? 200 : res.body.length,
+              )
+            : '(empty)';
+        print('[WP] non-200 body(head) => $head');
+        return [];
+      }
+
+      final decoded = jsonDecode(res.body);
+      if (decoded is! List) {
+        print('[WP] unexpected json type: ${decoded.runtimeType} base=$base');
+        return [];
+      }
+
+      final list = decoded as List<dynamic>;
+      print('[WP] ok: count=${list.length} base=$base');
+
+      // ✅ 1件だけ壊れてても全滅しないようにする
+      final posts = <Post>[];
+      for (final item in list) {
+        try {
+          if (item is Map<String, dynamic>) {
+            posts.add(Post.fromJson(item));
+          }
+        } catch (e) {
+          print('[WP] Post.fromJson failed base=$base => $e');
+        }
+      }
+
+      return posts;
+    } catch (e, st) {
+      print('[WP] EXCEPTION base=$base => $e');
+      print(st);
+      return [];
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // ① postsだけ（関連記事用など）
+  // ----------------------------------------------------------------------
+  Future<List<Post>> fetchLatestPosts({int page = 1, int perPage = 10}) async {
+    final uri = Uri.parse(
+      '$wpBaseUrl/posts?_embed=1&per_page=$perPage&page=$page',
+    );
+    print('[WP] GET => $uri');
+
+    final res = await _get(uri);
+    print(
+      '[WP] status=${res.statusCode} bytes=${res.bodyBytes.length} base=posts',
+    );
+
+    if (res.statusCode != 200) {
+      throw Exception('Failed to load posts: ${res.statusCode}');
+    }
+
+    final decoded = jsonDecode(res.body);
+    if (decoded is! List) return [];
+
+    return decoded
+        .whereType<Map<String, dynamic>>()
+        .map((m) => Post.fromJson(m))
+        .toList();
+  }
+
+  // ----------------------------------------------------------------------
+  // ② タイムライン/Explore：複数post_typeを混ぜる
+  // ----------------------------------------------------------------------
+  Future<List<Post>> fetchAllPosts({int perPage = 50}) async {
+    final lists = await Future.wait(
+      _restBases.map((b) => _fetchPostsFromBase(b, perPage: perPage)),
+    );
+
+    final all = <Post>[];
+    for (final l in lists) {
+      all.addAll(l);
+    }
+
+    // 重複除去
+    final seen = <int>{};
+    final unique = <Post>[];
+    for (final p in all) {
+      if (seen.add(p.id)) unique.add(p);
+    }
+
+    // 新しい順
+    unique.sort((a, b) => b.date.compareTo(a.date));
+    print('[WP] fetchAllPosts result => ${unique.length}');
+    return unique;
+  }
+
+  // ----------------------------------------------------------------------
+  // ③ Like API（/wp-json/gwc/v1/like） ※ここは変える必要なし
+  // ----------------------------------------------------------------------
+  Future<int> sendLike(int postId) async {
+    final deviceId = await _getDeviceId();
+
+    // wpBaseUrl: https://example.com/wp-json/wp/v2
+    // -> https://example.com/wp-json に戻す
+    final restBase = wpBaseUrl.replaceFirst(RegExp(r'/wp/v2/?$'), '');
+    final uri = Uri.parse('$restBase/gwc/v1/like');
+
+    final response = await _client
+        .post(
+          uri,
+          headers: {'Content-Type': 'application/json', ..._headers},
+          body: jsonEncode({'post_id': postId, 'device_id': deviceId}),
+        )
+        .timeout(const Duration(seconds: 15));
+
+    if (response.statusCode != 200) {
+      throw Exception('Like API error: ${response.statusCode}');
+    }
+
+    final Map<String, dynamic> json =
+        jsonDecode(response.body) as Map<String, dynamic>;
+    return (json['count'] ?? 0) as int;
+  }
+
+  Future<String> _getDeviceId() async {
+    const key = 'gwc_device_id';
+    final prefs = await SharedPreferences.getInstance();
+    final existing = prefs.getString(key);
+
+    if (existing != null && existing.isNotEmpty) return existing;
+
+    final random = Random();
+    final newId =
+        'dev-${DateTime.now().millisecondsSinceEpoch}-${random.nextInt(1 << 32)}';
+    await prefs.setString(key, newId);
+    return newId;
+  }
+
+  // ----------------------------------------------------------------------
+  // ⑤ コメント一覧
+  // ----------------------------------------------------------------------
+  Future<List<Comment>> fetchComments(int postId) async {
+    final uri = Uri.parse(
+      '$wpBaseUrl/comments?post=$postId&per_page=100&orderby=date&order=asc',
+    );
+
+    print('[WP] GET => $uri');
+    final res = await _get(uri);
+    print(
+      '[WP] status=${res.statusCode} bytes=${res.bodyBytes.length} base=comments',
+    );
+
+    if (res.statusCode != 200) {
+      throw Exception('Failed to load comments: ${res.statusCode}');
+    }
+
+    final decoded = jsonDecode(res.body);
+    if (decoded is! List) return [];
+
+    final comments = <Comment>[];
+    for (final item in decoded) {
+      if (item is Map<String, dynamic>) {
+        comments.add(Comment.fromJson(item));
+      }
+    }
+    return comments;
+  }
+
+  // ----------------------------------------------------------------------
+  // ⑥ コメント投稿
+  // ----------------------------------------------------------------------
+  Future<void> postComment({
+    required int postId,
+    required String authorName,
+    required String authorEmail,
+    required String content,
+  }) async {
+    final uri = Uri.parse('$wpBaseUrl/comments');
+
+    final response = await _client
+        .post(
+          uri,
+          headers: {'Content-Type': 'application/json', ..._headers},
+          body: jsonEncode({
+            'post': postId,
+            'author_name': authorName,
+            'author_email': authorEmail,
+            'content': content,
+          }),
+        )
+        .timeout(const Duration(seconds: 15));
+
+    if (response.statusCode != 201 && response.statusCode != 200) {
+      throw Exception('Failed to post comment: status ${response.statusCode}');
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // ⑦ バナー
+  // ----------------------------------------------------------------------
+  Future<ScrollBanner?> fetchScrollBanner() async {
+    try {
+      final uri = Uri.parse(scrollBannerApiUrl);
+      print('[WP] GET => $uri');
+
+      final res = await _get(uri);
+      print(
+        '[WP] status=${res.statusCode} bytes=${res.bodyBytes.length} base=scroll-banner',
+      );
+
+      if (res.statusCode != 200) return null;
+
+      final raw = jsonDecode(res.body);
+      if (raw is! Map<String, dynamic>) return null;
+
+      final banner = ScrollBanner.fromJson(raw);
+      if (!banner.shouldShow) return null;
+
+      return banner;
+    } catch (e) {
+      print('[WP] fetchScrollBanner exception => $e');
+      return null;
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // ⑧ postsカテゴリslugから一覧（posts専用）
+  // ----------------------------------------------------------------------
+  Future<List<Post>> fetchPostsByCategorySlug(
+    String slug, {
+    int perPage = 20,
+  }) async {
+    final catUri = Uri.parse('$wpBaseUrl/categories?slug=$slug');
+    print('[WP] GET => $catUri');
+
+    final catRes = await _get(catUri);
+    print('[WP] status=${catRes.statusCode} base=categories');
+
+    if (catRes.statusCode != 200) {
+      throw Exception('Failed to load category: ${catRes.statusCode}');
+    }
+
+    final catJson = jsonDecode(catRes.body);
+    if (catJson is! List || catJson.isEmpty) return [];
+
+    final int catId = (catJson.first as Map<String, dynamic>)['id'] as int;
+
+    final postsUri = Uri.parse(
+      '$wpBaseUrl/posts?_embed=1&per_page=$perPage&categories=$catId',
+    );
+    print('[WP] GET => $postsUri');
+
+    final postsRes = await _get(postsUri);
+    print('[WP] status=${postsRes.statusCode} base=posts(byCategory)');
+
+    if (postsRes.statusCode != 200) {
+      throw Exception('Failed to load category posts: ${postsRes.statusCode}');
+    }
+
+    final decoded = jsonDecode(postsRes.body);
+    if (decoded is! List) return [];
+
+    return decoded
+        .whereType<Map<String, dynamic>>()
+        .map((m) => Post.fromJson(m))
+        .toList();
+  }
+
+  // ----------------------------------------------------------------------
+  // ✅ 横断検索（複数post_type）
+  // ----------------------------------------------------------------------
+  Future<List<Post>> searchAllPosts({
+    required String query,
+    int perPage = 30,
+    int page = 1,
+    bool sortByDate = false,
+  }) async {
+    final trimmed = query.trim();
+    if (trimmed.isEmpty) return [];
+
+    final lists = await Future.wait(
+      _restBases.map(
+        (b) => _fetchPostsFromBase(
+          b,
+          perPage: perPage,
+          page: page,
+          searchQuery: trimmed,
+        ),
+      ),
+    );
+
+    final all = <Post>[];
+    for (final l in lists) {
+      all.addAll(l);
+    }
+
+    final seen = <int>{};
+    final unique = <Post>[];
+    for (final p in all) {
+      if (seen.add(p.id)) unique.add(p);
+    }
+
+    if (sortByDate) {
+      unique.sort((a, b) => b.date.compareTo(a.date));
+    }
+
+    print('[WP] searchAllPosts("$trimmed") result => ${unique.length}');
+    return unique;
+  }
+}

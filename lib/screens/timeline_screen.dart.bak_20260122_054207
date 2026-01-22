@@ -1,0 +1,347 @@
+// lib/screens/timeline_screen.dart
+//
+// ✅ Timeline（Instagram風）
+// - 背景色を固定で黒にしない（Themeに従う = ダークモード対応）
+// - CTAボタンはオレンジ
+// - YouTubeは「標準コントローラ無し」でもAndroidで再生開始できる（透明タップ）
+// - 再生中でも外部へ飛ばない/誤操作しない（プレイヤー本体はタッチ無効）
+
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:visibility_detector/visibility_detector.dart';
+
+import '../model/post.dart';
+import '../service/wp_api_service.dart';
+import '../utils/gw_youtube.dart';
+import '../widgets/gw_youtube_player.dart';
+import 'post_detail_screen.dart';
+
+class TimelineScreen extends StatefulWidget {
+  const TimelineScreen({super.key});
+
+  @override
+  State<TimelineScreen> createState() => _TimelineScreenState();
+}
+
+class _TimelineScreenState extends State<TimelineScreen> {
+  final _api = WpApiService();
+  late Future<List<Post>> _future;
+
+  int? _activePostId;
+  final Map<int, double> _visible = {};
+
+  @override
+  void initState() {
+    super.initState();
+
+    // ✅ 重要：tekkenが少ない原因は「postsを30件しか取ってない」可能性が高い
+    // → fetchAllPosts側で posts は複数ページ取るように修正済み（下のwp_api_service.dart参照）
+    _future = _api.fetchAllPosts();
+  }
+
+  // ★自分のWPドメインに合わせる（超重要）
+  static const String _wpOrigin = 'https://gamewidth.net';
+
+  String? _safeImageUrl(String? url) {
+    if (url == null) return null;
+    final s = url.trim();
+    if (s.isEmpty) return null;
+
+    // avif回避
+    final noQuery = s.toLowerCase().split('?').first;
+    if (noQuery.endsWith('.avif')) return null;
+
+    if (s.startsWith('//')) return 'https:$s';
+    if (s.startsWith('/')) return '$_wpOrigin$s';
+    if (s.startsWith('http://')) return s.replaceFirst('http://', 'https://');
+
+    return s;
+  }
+
+  String? _imageUrlOf(Post p) {
+    final cands = <String?>[p.imageUrl];
+    for (final c in cands) {
+      final ok = _safeImageUrl(c);
+      if (ok != null) return ok;
+    }
+    return null;
+  }
+
+  String? _videoIdOf(Post p) {
+    final raw = (p.youtubeId ?? p.pageVideoId ?? '').trim();
+    if (raw.isEmpty) return null;
+    return gwExtractYoutubeId(raw) ?? raw;
+  }
+
+  DateTime? _dateOf(Post p) => p.date;
+
+  void _onVisible(Post p, double fraction) {
+    if (fraction <= 0) {
+      _visible.remove(p.id);
+    } else {
+      _visible[p.id] = fraction;
+    }
+
+    int? bestId;
+    double best = 0;
+
+    _visible.forEach((id, v) {
+      if (v > best) {
+        best = v;
+        bestId = id;
+      }
+    });
+
+    if (bestId == null) return;
+    if (best < 0.55) return;
+
+    if (_activePostId == bestId) return;
+    setState(() => _activePostId = bestId);
+  }
+
+  String _fmtDate(DateTime? d) {
+    if (d == null) return '';
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${d.year}-${two(d.month)}-${two(d.day)}';
+  }
+
+  Widget _thumbYoutube(String vid) {
+    final url =
+        gwYoutubeThumbFromSrc(vid) ??
+        ('https://img.youtube.com/vi/' + vid + '/hqdefault.jpg');
+    return CachedNetworkImage(
+      imageUrl: url,
+      fit: BoxFit.cover,
+      placeholder: (_, __) => const ColoredBox(color: Colors.black12),
+      errorWidget: (_, __, ___) => const ColoredBox(color: Colors.black12),
+    );
+  }
+
+  Widget _thumbImage(String url) {
+    final u = url.trim();
+    if (u.isEmpty) {
+      debugPrint('IMG FAIL (empty url)');
+      return const ColoredBox(color: Colors.black12);
+    }
+
+    // ✅ Webだけは CachedNetworkImage を使わず、素の Image.network に落とす
+    if (kIsWeb) {
+      debugPrint('IMG(web) $u');
+      return Image.network(
+        u,
+        fit: BoxFit.cover,
+        errorBuilder: (context, err, st) {
+          debugPrint('IMG FAIL (web) url=$u err=$err');
+          return const ColoredBox(color: Colors.black12);
+        },
+      );
+    }
+
+    // ✅ iOS/Android/macOS は CachedNetworkImage 維持
+    debugPrint('IMG(native) $u');
+    return CachedNetworkImage(
+      imageUrl: u,
+      fit: BoxFit.cover,
+      placeholder: (_, __) => const ColoredBox(color: Colors.black12),
+      errorWidget: (_, __, err) {
+        debugPrint('IMG FAIL (native) url=$u err=$err');
+        return const ColoredBox(color: Colors.black12);
+      },
+    );
+  }
+
+  Widget _noImage(ColorScheme cs) {
+    return ColoredBox(
+      color: cs.surfaceContainerHighest,
+      child: Center(
+        child: Icon(
+          Icons.image_not_supported,
+          color: cs.onSurfaceVariant,
+          size: 42,
+        ),
+      ),
+    );
+  }
+
+  Widget _media(Post p, ColorScheme cs) {
+    final vid = _videoIdOf(p);
+    final img = _imageUrlOf(p);
+
+    if (vid != null && vid.isNotEmpty) {
+      final active = (_activePostId == p.id);
+
+      // ✅ activeだけ再生させる
+      if (active) {
+        return GwYoutubePlayer(
+          videoId: vid,
+          autoplay: true,
+          mute: true,
+          showYoutubeControls: false, // YouTube標準UIは出さない
+          enableTapToPlay: true, // Android対策：タップで再生開始
+          showOverlaySeek: false, // タイムラインは不要ならfalse
+          aspectRatio: 16 / 9,
+        );
+      }
+
+      // 非アクティブはサムネ
+      return _thumbYoutube(vid);
+    }
+
+    if (img != null) return _thumbImage(img);
+    return _noImage(cs);
+  }
+
+  void _openDetail(Post p) {
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => PostDetailScreen(post: p)));
+  }
+
+  Widget _badgeIcon({required Post p}) {
+    final vid = _videoIdOf(p);
+    final hasVideo = vid != null && vid.isNotEmpty;
+    final active = hasVideo && (_activePostId == p.id);
+
+    final icon = hasVideo
+        ? (active ? Icons.volume_off : Icons.play_arrow)
+        : Icons.image_outlined;
+
+    return Positioned(
+      top: 8,
+      right: 8,
+      child: Container(
+        padding: const EdgeInsets.all(7),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.35),
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Icon(icon, size: 16, color: Colors.white),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return Scaffold(
+      backgroundColor: cs.surface, // ✅ 黒固定やめる
+      body: FutureBuilder<List<Post>>(
+        future: _future,
+        builder: (context, snap) {
+          if (snap.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snap.hasError) {
+            return Center(
+              child: Text(
+                '読み込みエラー: ${snap.error}',
+                style: TextStyle(color: cs.onSurface),
+              ),
+            );
+          }
+
+          final posts = (snap.data ?? [])
+              .where((p) => p.showInHomepage == true)
+              .toList();
+
+          if (posts.isEmpty) {
+            return Center(
+              child: Text('投稿がありません', style: TextStyle(color: cs.onSurface)),
+            );
+          }
+
+          _activePostId ??= posts.first.id;
+
+          return ListView.builder(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            itemCount: posts.length,
+            itemBuilder: (context, i) {
+              final p = posts[i];
+
+              return VisibilityDetector(
+                key: Key('post-${p.id}'),
+                onVisibilityChanged: (info) =>
+                    _onVisible(p, info.visibleFraction),
+                child: Container(
+                  margin: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: cs.surfaceContainerHighest, // ✅ 黒固定やめる
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      AspectRatio(
+                        aspectRatio: 16 / 9,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            _media(p, cs),
+                            _badgeIcon(p: p),
+                          ],
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              _fmtDate(_dateOf(p)),
+                              style: TextStyle(
+                                color: cs.onSurfaceVariant,
+                                fontSize: 12,
+                                height: 1.2,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              p.title,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: cs.onSurface,
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+
+                            // ✅ CTA オレンジ
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton(
+                                onPressed: () => _openDetail(p),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.orange,
+                                  foregroundColor: Colors.black,
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 12,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                ),
+                                child: const Text('続きを読む'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}

@@ -1,0 +1,178 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:youtube_player_iframe/youtube_player_iframe.dart';
+import 'package:my_first_app/utils/gw_youtube.dart';
+
+class GwYoutubePlayer extends StatefulWidget {
+  const GwYoutubePlayer({
+    super.key,
+    required this.videoId,
+    this.autoplay = false,
+    this.mute = true,
+    this.useAspectRatio = true,
+    this.useCard = true,
+    this.showYoutubeControls = true,
+    this.enableTapToPlay = false,
+    this.showOverlaySeek = false,
+    this.aspectRatio,
+  });
+
+  final String videoId;
+  final bool autoplay;
+  final bool mute;
+  final bool useAspectRatio;
+  final bool useCard;
+  final bool showYoutubeControls;
+  final bool enableTapToPlay;
+  final bool showOverlaySeek;
+  final double? aspectRatio;
+
+  @override
+  State<GwYoutubePlayer> createState() => _GwYoutubePlayerState();
+}
+
+class _GwYoutubePlayerState extends State<GwYoutubePlayer> {
+  late final YoutubePlayerController _controller;
+
+  StreamSubscription<YoutubePlayerValue>? _valueSub;
+  StreamSubscription<YoutubeVideoState>? _videoStateSub;
+
+  bool _ready = false;
+  Duration _position = Duration.zero;
+
+  bool _isReady(YoutubePlayerValue v) => v.playerState != PlayerState.unknown;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _controller = YoutubePlayerController.fromVideoId(
+      videoId: widget.videoId,
+      params: YoutubePlayerParams(
+        showControls: widget.showYoutubeControls,
+        showFullscreenButton: false,
+        mute: widget.mute,
+      ),
+    );
+
+    _valueSub = _controller.stream.listen((v) async {
+      if (!_ready && _isReady(v)) {
+        if (mounted) setState(() => _ready = true);
+
+        if (widget.mute) {
+          await _controller.mute();
+        }
+        if (widget.autoplay) {
+          await _controller.playVideo();
+        }
+      }
+    });
+
+    _videoStateSub = _controller.videoStateStream.listen((s) {
+      _position = s.position;
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant GwYoutubePlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    
+    if (oldWidget.videoId != widget.videoId) {
+      _ready = false;
+      
+      () async {
+        try {
+          await _controller.loadVideoById(videoId: widget.videoId);
+        } catch (_) {
+          
+        }
+      }();
+    }
+
+    
+    if (oldWidget.autoplay == true && widget.autoplay == false) {
+      () async {
+        try {
+          await _controller.pauseVideo();
+        } catch (_) {}
+      }();
+    }
+
+    
+    if (oldWidget.mute != widget.mute) {
+      () async {
+        try {
+          if (widget.mute) {
+            await _controller.mute();
+          } else {
+            await _controller.unMute();
+          }
+        } catch (_) {}
+      }();
+    }
+  }
+
+  Future<void> _togglePlayPause() async {
+    if (!_ready) return;
+    final st = _controller.value.playerState;
+    if (st == PlayerState.playing) {
+      await _controller.pauseVideo();
+    } else {
+      await _controller.playVideo();
+    }
+  }
+
+  int get nowSeconds => _position.inSeconds;
+
+  @override
+  void dispose() {
+    _valueSub?.cancel();
+    _videoStateSub?.cancel();
+    _controller.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ar = widget.aspectRatio ?? 16 / 9;
+
+    final player = YoutubePlayer(controller: _controller, aspectRatio: ar);
+
+    Widget child = Stack(
+      fit: StackFit.expand,
+      children: [
+        player,
+        if (!_ready)
+          Positioned.fill(
+            child: Image.network(
+              gwYoutubeThumbFromSrc(widget.videoId) ??
+                  ('https:
+                      widget.videoId +
+                      '/hqdefault.jpg'),
+              fit: BoxFit.cover,
+              gaplessPlayback: true,
+              errorBuilder: (_, __, ___) =>
+                  const ColoredBox(color: Colors.black12),
+            ),
+          ),
+      ],
+    );
+
+    if (widget.enableTapToPlay) {
+      child = GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _togglePlayPause,
+        child: child,
+      );
+    }
+
+    if (!widget.useCard) return child;
+
+    return Material(
+      elevation: 2,
+      borderRadius: BorderRadius.circular(12),
+      child: child,
+    );
+  }
+}

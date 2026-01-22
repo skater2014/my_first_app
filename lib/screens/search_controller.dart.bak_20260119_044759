@@ -1,0 +1,226 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+
+import 'search_models.dart';
+import 'search_repository.dart';
+
+class SearchController extends ChangeNotifier {
+  SearchController({SearchRepository? repo})
+    : _repo = repo ?? SearchRepository();
+
+  final SearchRepository _repo;
+
+  SearchState _state = SearchState.initial();
+  SearchState get state => _state;
+
+  final _debouncer = _Debouncer(const Duration(milliseconds: 250));
+  int _token = 0;
+
+  void disposeController() {
+    _debouncer.dispose();
+  }
+
+  Future<void> boot() async {
+    final token = ++_token;
+    _state = _state.copyWith(loading: true, error: null, taxonomyReady: false);
+    notifyListeners();
+
+    try {
+      // taxonomy
+      final genshinId = await _repo.fetchTermIdBySlug(
+        taxonomy: 'categories',
+        slug: SearchRepository.genshinCategorySlug,
+      );
+      if (token != _token) return;
+
+      final tekkenId = await _repo.fetchTermIdBySlug(
+        taxonomy: 'categories',
+        slug: SearchRepository.tekkenCategorySlug,
+      );
+      if (token != _token) return;
+
+      final rarityIds = await _repo.fetchTagIdsBySlugs(
+        SearchRepository.rarityTagSlug,
+      );
+      if (token != _token) return;
+
+      final elementIds = await _repo.fetchTagIdsBySlugs(
+        SearchRepository.elementTagSlug,
+      );
+      if (token != _token) return;
+
+      final weaponIds = await _repo.fetchTagIdsBySlugs(
+        SearchRepository.weaponTagSlug,
+      );
+      if (token != _token) return;
+
+      // posts
+      final all = await _repo.loadAllPosts();
+      if (token != _token) return;
+
+      _state = _state.copyWith(
+        genshinCategoryId: genshinId,
+        tekkenCategoryId: tekkenId,
+        rarityTagId: rarityIds,
+        elementTagId: elementIds,
+        weaponTagId: weaponIds,
+        allItems: all,
+        taxonomyReady: true,
+      );
+
+      _applyViewInternal();
+    } catch (e) {
+      if (token != _token) return;
+      _state = _state.copyWith(error: 'Boot failed: $e');
+      notifyListeners();
+    } finally {
+      if (token != _token) return;
+      _state = _state.copyWith(loading: false);
+      notifyListeners();
+    }
+  }
+
+  Future<void> refresh() async {
+    final token = ++_token;
+    _state = _state.copyWith(loading: true, error: null);
+    notifyListeners();
+
+    try {
+      final all = await _repo.loadAllPosts();
+      if (token != _token) return;
+
+      _state = _state.copyWith(allItems: all);
+      _applyViewInternal();
+    } catch (e) {
+      if (token != _token) return;
+      _state = _state.copyWith(error: 'Reload failed: $e');
+      notifyListeners();
+    } finally {
+      if (token != _token) return;
+      _state = _state.copyWith(loading: false);
+      notifyListeners();
+    }
+  }
+
+  void setQuery(String text) {
+    _state = _state.copyWith(query: text);
+    notifyListeners();
+    _debouncer.run(_applyViewInternal);
+  }
+
+  void clearQuery() {
+    _state = _state.copyWith(query: '');
+    notifyListeners();
+    _applyViewInternal();
+  }
+
+  void switchTab(SearchTab next) {
+    if (next == _state.tab) return;
+
+    // Tekken/All はフィルタ不要なので消す
+    final clearFilters = (next != SearchTab.genshin);
+
+    _state = _state.copyWith(
+      tab: next,
+      error: null,
+      query: '',
+      selRarity: clearFilters ? <int>{} : _state.selRarity,
+      selElement: clearFilters ? <int>{} : _state.selElement,
+      selWeapon: clearFilters ? <int>{} : _state.selWeapon,
+    );
+    notifyListeners();
+    _applyViewInternal();
+  }
+
+  void resetFilters() {
+    _state = _state.copyWith(
+      selRarity: <int>{},
+      selElement: <int>{},
+      selWeapon: <int>{},
+    );
+    notifyListeners();
+    _applyViewInternal();
+  }
+
+  void toggleRarity(int tagId) => _toggleTag('rarity', tagId);
+  void toggleElement(int tagId) => _toggleTag('element', tagId);
+  void toggleWeapon(int tagId) => _toggleTag('weapon', tagId);
+
+  void _toggleTag(String type, int tagId) {
+    if (tagId == 0) return;
+
+    Set<int> next(Set<int> cur) {
+      final s = Set<int>.from(cur);
+      if (s.contains(tagId)) {
+        s.remove(tagId);
+      } else {
+        s.add(tagId);
+      }
+      return s;
+    }
+
+    if (type == 'rarity') {
+      _state = _state.copyWith(selRarity: next(_state.selRarity));
+    } else if (type == 'element') {
+      _state = _state.copyWith(selElement: next(_state.selElement));
+    } else {
+      _state = _state.copyWith(selWeapon: next(_state.selWeapon));
+    }
+
+    notifyListeners();
+    _applyViewInternal();
+  }
+
+  void _applyViewInternal() {
+    var out = List<CardPost>.from(_state.allItems);
+
+    // tab filter by category
+    if (_state.tab == SearchTab.genshin && _state.genshinCategoryId != 0) {
+      out = out
+          .where((x) => x.categoryIds.contains(_state.genshinCategoryId))
+          .toList();
+    } else if (_state.tab == SearchTab.tekken && _state.tekkenCategoryId != 0) {
+      out = out
+          .where((x) => x.categoryIds.contains(_state.tekkenCategoryId))
+          .toList();
+    }
+
+    // query filter
+    final q = _state.query.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      out = out.where((x) => x.name.toLowerCase().contains(q)).toList();
+    }
+
+    // genshin filters
+    if (_state.tab == SearchTab.genshin) {
+      if (_state.selRarity.isNotEmpty) {
+        out = out.where((x) => x.hasAnyTag(_state.selRarity)).toList();
+      }
+      if (_state.selElement.isNotEmpty) {
+        out = out.where((x) => x.hasAnyTag(_state.selElement)).toList();
+      }
+      if (_state.selWeapon.isNotEmpty) {
+        out = out.where((x) => x.hasAnyTag(_state.selWeapon)).toList();
+      }
+    }
+
+    out.sort((a, b) => b.date.compareTo(a.date));
+    _state = _state.copyWith(viewItems: out);
+    notifyListeners();
+  }
+}
+
+class _Debouncer {
+  final Duration delay;
+  Timer? _timer;
+  _Debouncer(this.delay);
+
+  void run(void Function() action) {
+    _timer?.cancel();
+    _timer = Timer(delay, action);
+  }
+
+  void dispose() {
+    _timer?.cancel();
+  }
+}

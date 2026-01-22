@@ -1,0 +1,363 @@
+import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:visibility_detector/visibility_detector.dart';
+
+import '../../utils/gw_url.dart';
+import '../../utils/gw_youtube.dart';
+import '../../widgets/gw_youtube_player.dart';
+import 'search_models.dart';
+import 'gw_search_controller.dart';
+
+class SearchFilters extends StatelessWidget {
+  const SearchFilters({
+    super.key,
+    required this.state,
+    required this.onClear,
+    required this.onToggleRarity,
+    required this.onToggleElement,
+    required this.onToggleWeapon,
+  });
+
+  final SearchState state;
+  final VoidCallback onClear;
+  final void Function(int) onToggleRarity;
+  final void Function(int) onToggleElement;
+  final void Function(int) onToggleWeapon;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasAny =
+        state.selectedRarities.isNotEmpty ||
+        state.selectedElements.isNotEmpty ||
+        state.selectedWeapons.isNotEmpty;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          if (hasAny)
+            TextButton(onPressed: onClear, child: const Text('Clear')),
+
+          _chipRow(
+            label: 'Rarity',
+            values: const [5, 4],
+            selected: state.selectedRarities,
+            onTap: onToggleRarity,
+          ),
+          _chipRow(
+            label: 'Element',
+            values: const [1, 2, 3, 4, 5, 6, 7],
+            selected: state.selectedElements,
+            onTap: onToggleElement,
+          ),
+          _chipRow(
+            label: 'Weapon',
+            values: const [1, 2, 3, 4, 5],
+            selected: state.selectedWeapons,
+            onTap: onToggleWeapon,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _chipRow({
+    required String label,
+    required List<int> values,
+    required Set<int> selected,
+    required void Function(int) onTap,
+  }) {
+    return Wrap(
+      spacing: 6,
+      runSpacing: 6,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        Text(label),
+        for (final v in values)
+          FilterChip(
+            label: Text('$v'),
+            selected: selected.contains(v),
+            onSelected: (_) => onTap(v),
+          ),
+      ],
+    );
+  }
+}
+
+class SearchGrid extends StatefulWidget {
+  const SearchGrid({
+    super.key,
+    required this.items,
+    required this.loading,
+    required this.onTapItem,
+  });
+
+  final List<SearchItem> items;
+  final bool loading;
+  final void Function(SearchItem item) onTapItem;
+
+  @override
+  State<SearchGrid> createState() => _SearchGridState();
+}
+
+class _SearchGridState extends State<SearchGrid> {
+  int? _activeId;
+  final Map<int, double> _visible = {};
+
+  void _onVisible(int id, double fraction) {
+    if (fraction <= 0) {
+      _visible.remove(id);
+    } else {
+      _visible[id] = fraction;
+    }
+
+    int? bestId;
+    double best = 0;
+
+    _visible.forEach((k, v) {
+      if (v > best) {
+        best = v;
+        bestId = k;
+      }
+    });
+
+    if (bestId == null) return;
+    if (best < 0.55) return;
+
+    if (_activeId == bestId) return;
+    setState(() => _activeId = bestId);
+  }
+
+  // 「同じ行に動画2つ」をできるだけ避ける（完全には保証不可だが改善）
+  List<SearchItem> _arrangeNoDoubleYoutube(List<SearchItem> items) {
+    final ys = <SearchItem>[];
+    final ns = <SearchItem>[];
+
+    for (final it in items) {
+      if (it.hasYoutube) {
+        ys.add(it);
+      } else {
+        ns.add(it);
+      }
+    }
+
+    final out = <SearchItem>[];
+
+    while (ys.isNotEmpty || ns.isNotEmpty) {
+      // 1枠目
+      if (ys.isNotEmpty) {
+        out.add(ys.removeAt(0));
+      } else if (ns.isNotEmpty) {
+        out.add(ns.removeAt(0));
+      }
+
+      // 2枠目（1枠目がYouTubeなら、できれば非YouTubeを入れる）
+      if (out.length.isOdd) {
+        final firstIsYt = out.isNotEmpty && out.last.hasYoutube;
+        if (firstIsYt && ns.isNotEmpty) {
+          out.add(ns.removeAt(0));
+        } else if (ns.isNotEmpty) {
+          out.add(ns.removeAt(0));
+        } else if (ys.isNotEmpty) {
+          out.add(ys.removeAt(0));
+        }
+      }
+    }
+
+    return out;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final view = _arrangeNoDoubleYoutube(widget.items);
+    _activeId ??= view.isNotEmpty ? view.first.id : null;
+
+    return CustomScrollView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      slivers: [
+        const SliverPadding(padding: EdgeInsets.only(top: 8)),
+        SliverPadding(
+          padding: EdgeInsets.fromLTRB(12, 0, 12, bottomPad),
+          sliver: SliverGrid(
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 2,
+              crossAxisSpacing: 12,
+              mainAxisSpacing: 12,
+              childAspectRatio: 0.78,
+            ),
+            delegate: SliverChildBuilderDelegate((context, i) {
+              final it = view[i];
+              return VisibilityDetector(
+                key: Key('search-${it.id}'),
+                onVisibilityChanged: (info) =>
+                    _onVisible(it.id, info.visibleFraction),
+                child: _Card(
+                  item: it,
+                  active: _activeId == it.id,
+                  onTap: () => widget.onTapItem(it),
+                ),
+              );
+            }, childCount: view.length),
+          ),
+        ),
+        if (widget.loading)
+          const SliverToBoxAdapter(
+            child: Padding(
+              padding: EdgeInsets.symmetric(vertical: 16),
+              child: Center(child: CircularProgressIndicator()),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _Card extends StatelessWidget {
+  const _Card({required this.item, required this.active, required this.onTap});
+
+  final SearchItem item;
+  final bool active;
+  final VoidCallback onTap;
+
+  String? _thumbOf(SearchItem item) {
+    final raw0 = item.thumbUrl;
+    final fixed0 = gwFixMediaUrl(raw0);
+    debugPrint('thumb raw=$raw0 fixed=$fixed0 vid=${item.videoId}');
+    final raw = item.thumbUrl?.trim();
+    if (raw != null && raw.isNotEmpty) {
+      return gwFixMediaUrl(raw) ?? raw;
+    }
+    final vid = item.videoId?.trim();
+    if (item.hasYoutube && vid != null && vid.isNotEmpty) {
+      return gwYoutubeThumbFromSrc(vid);
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    final hasVideo =
+        item.hasYoutube && (item.videoId?.trim().isNotEmpty ?? false);
+    final vid = item.videoId?.trim();
+    final thumb = _thumbOf(item);
+
+    Widget media;
+
+    if (hasVideo && active && vid != null) {
+      // ✅ スクロール最優先：動画がタッチを奪わない
+      // ✅ 描画の境界を固定：重なり/はみ出しを減らす
+      media = RepaintBoundary(
+        child: ClipRect(
+          child: IgnorePointer(
+            ignoring: true,
+            child: GwYoutubePlayer(
+              videoId: vid,
+              autoplay: true,
+              mute: true,
+              showYoutubeControls: false,
+              enableTapToPlay: false,
+              showOverlaySeek: false,
+              aspectRatio: 16 / 9,
+              useCard: false,
+            ),
+          ),
+        ),
+      );
+    } else if (thumb != null && thumb.isNotEmpty) {
+      media = CachedNetworkImage(
+        imageUrl: thumb,
+        fit: BoxFit.cover,
+        placeholder: (_, __) => const ColoredBox(color: Colors.black12),
+        errorWidget: (context, url, error) {
+          debugPrint("IMG FAIL url= err=");
+          return const ColoredBox(color: Colors.black12);
+        },
+      );
+    } else {
+      media = Container(
+        color: cs.surfaceContainerHighest,
+        child: Center(
+          child: Icon(
+            Icons.image_not_supported_outlined,
+            color: cs.onSurfaceVariant,
+          ),
+        ),
+      );
+    }
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Ink(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(14),
+          color: cs.surface,
+          border: Border.all(color: Theme.of(context).dividerColor),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: ClipRRect(
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(14),
+                ),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    media,
+
+                    if (hasVideo)
+                      Positioned(
+                        left: 8,
+                        bottom: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(999),
+                            color: Colors.black.withOpacity(0.55),
+                          ),
+                          child: Text(
+                            active ? 'PLAY' : 'YT',
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+              child: Text(
+                item.name,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+              child: Text(
+                item.base,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.labelSmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,483 @@
+import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:visibility_detector/visibility_detector.dart';
+
+import '../../utils/gw_url.dart';
+import '../../utils/gw_youtube.dart';
+import '../../widgets/gw_youtube_player.dart';
+import 'search_models.dart';
+
+// ============================================================
+// ✅ Web(HTML) の filters-list を Flutter で再現するための定義
+// - HTML の data-filter/alt に合わせた “名前” を持つ
+// - ただし、アプリ内はID(int)で管理（APIに渡すため）
+// ============================================================
+const String _gwGenshinIconRoot =
+    'https://gamewidth.net/wp-content/themes/Xiaoyu%20Tekken7/images/genshin/';
+
+String _gwIconUrl(String file) => Uri.encodeFull('$_gwGenshinIconRoot$file');
+
+class _FilterDef {
+  const _FilterDef({
+    required this.id,
+    required this.name, // HTML data-filter/alt 相当
+    required this.iconFile,
+  });
+  final int id;         // アプリ内部用（Set<int>で管理）
+  final String name;    // 表示/tooltip 用（HTMLと一致）
+  final String iconFile;
+}
+
+const List<_FilterDef> _rarityDefs = [
+  _FilterDef(id: 4, name: '4', iconFile: 'rarity_4.png'),
+  _FilterDef(id: 5, name: '5', iconFile: 'rarity_5.png'),
+];
+
+const List<_FilterDef> _elementDefs = [
+  _FilterDef(id: 1, name: 'Anemo',   iconFile: 'element_anemo.png'),
+  _FilterDef(id: 2, name: 'Cryo',    iconFile: 'element_cryo.png'),
+  _FilterDef(id: 3, name: 'Electro', iconFile: 'element_electro.png'),
+  _FilterDef(id: 4, name: 'Dendro',  iconFile: 'element_dendro.png'),
+  _FilterDef(id: 5, name: 'Geo',     iconFile: 'element_geo.png'),
+  _FilterDef(id: 6, name: 'Hydro',   iconFile: 'element_hydro.png'),
+  _FilterDef(id: 7, name: 'Pyro',    iconFile: 'element_pyro.png'),
+];
+
+const List<_FilterDef> _weaponDefs = [
+  _FilterDef(id: 1, name: 'Bow',      iconFile: 'weapon_bow.png'),
+  _FilterDef(id: 2, name: 'Catalyst', iconFile: 'weapon_catalyst.png'),
+  _FilterDef(id: 3, name: 'Claymore', iconFile: 'weapon_claymore.png'),
+  _FilterDef(id: 4, name: 'Polearm',  iconFile: 'weapon_polearm.png'),
+  _FilterDef(id: 5, name: 'Sword',    iconFile: 'weapon_sword.png'),
+];
+
+// ============================================================
+// ✅ フィルター状態は SearchScreen ではなく “ここ” が管理
+// - SearchScreen は controller を持つだけ（中身の Set を触らない）
+// ============================================================
+class GenshinFilterController extends ChangeNotifier {
+  final Set<int> rarities = {};
+  final Set<int> elements = {};
+  final Set<int> weapons = {};
+
+  bool get hasAny =>
+      rarities.isNotEmpty || elements.isNotEmpty || weapons.isNotEmpty;
+
+  void clear() {
+    rarities.clear();
+    elements.clear();
+    weapons.clear();
+    notifyListeners();
+  }
+
+  void toggleRarity(int v) {
+    rarities.contains(v) ? rarities.remove(v) : rarities.add(v);
+    notifyListeners();
+  }
+
+  void toggleElement(int v) {
+    elements.contains(v) ? elements.remove(v) : elements.add(v);
+    notifyListeners();
+  }
+
+  void toggleWeapon(int v) {
+    weapons.contains(v) ? weapons.remove(v) : weapons.add(v);
+    notifyListeners();
+  }
+}
+
+// ============================================================
+// ✅ Webの <div class="filters-list"> を Flutter で再現
+// - Rarity / Element / Weapon の見出し + 画像アイコン
+// - “画像をタップ” で on/off（FilterChipみたいな数字は出さない）
+// ============================================================
+class GenshinIconFiltersBar extends StatelessWidget {
+  const GenshinIconFiltersBar({
+    super.key,
+    required this.c,
+  });
+
+  final GenshinFilterController c;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return AnimatedBuilder(
+      animation: c,
+      builder: (context, _) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (c.hasAny)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton(
+                    onPressed: c.clear,
+                    child: const Text('Clear'),
+                  ),
+                ),
+
+              _group(
+                title: 'Rarity',
+                defs: _rarityDefs,
+                selected: c.rarities,
+                onTap: c.toggleRarity,
+                cs: cs,
+              ),
+              const SizedBox(height: 8),
+
+              _group(
+                title: 'Element',
+                defs: _elementDefs,
+                selected: c.elements,
+                onTap: c.toggleElement,
+                cs: cs,
+              ),
+              const SizedBox(height: 8),
+
+              _group(
+                title: 'Weapon',
+                defs: _weaponDefs,
+                selected: c.weapons,
+                onTap: c.toggleWeapon,
+                cs: cs,
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _group({
+    required String title,
+    required List<_FilterDef> defs,
+    required Set<int> selected,
+    required void Function(int) onTap,
+    required ColorScheme cs,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            for (final d in defs)
+              Tooltip(
+                message: d.name, // HTML alt と一致
+                child: InkWell(
+                  onTap: () => onTap(d.id),
+                  borderRadius: BorderRadius.circular(999),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 120),
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(
+                        width: 2,
+                        color: selected.contains(d.id)
+                            ? Colors.blueAccent
+                            : Colors.transparent,
+                      ),
+                      color: selected.contains(d.id)
+                          ? cs.primaryContainer.withOpacity(0.25)
+                          : cs.surfaceVariant.withOpacity(0.20),
+                    ),
+                    child: SizedBox(
+                      width: 28,
+                      height: 28,
+                      child: CachedNetworkImage(
+                        imageUrl: _gwIconUrl(d.iconFile),
+                        fit: BoxFit.contain,
+                        memCacheWidth: 96,
+                        placeholder: (_, __) => const SizedBox.shrink(),
+                        errorWidget: (_, __, ___) =>
+                            const Icon(Icons.broken_image, size: 18),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+// ============================================================
+// ✅ SearchGrid（そのまま：動画は “見えてる1つだけ” を active にする）
+// ============================================================
+class SearchGrid extends StatefulWidget {
+  const SearchGrid({
+    super.key,
+    required this.items,
+    required this.loading,
+    required this.onTapItem,
+  });
+
+  final List<SearchItem> items;
+  final bool loading;
+  final void Function(SearchItem item) onTapItem;
+
+  @override
+  State<SearchGrid> createState() => _SearchGridState();
+}
+
+class _SearchGridState extends State<SearchGrid> {
+  int? _activeId;
+  final Map<int, double> _visible = {};
+
+  void _onVisible(int id, double fraction) {
+    if (!mounted) return;
+    if (fraction <= 0) {
+      _visible.remove(id);
+    } else {
+      _visible[id] = fraction;
+    }
+
+    int? bestId;
+    double best = 0;
+
+    _visible.forEach((k, v) {
+      if (v > best) {
+        best = v;
+        bestId = k;
+      }
+    });
+
+    if (bestId == null) return;
+    if (best < 0.55) return;
+    if (_activeId == bestId) return;
+
+    setState(() => _activeId = bestId);
+  }
+
+  List<SearchItem> _arrangeNoDoubleYoutube(List<SearchItem> items) {
+    final ys = <SearchItem>[];
+    final ns = <SearchItem>[];
+
+    for (final it in items) {
+      if (it.hasYoutube) {
+        ys.add(it);
+      } else {
+        ns.add(it);
+      }
+    }
+
+    final out = <SearchItem>[];
+
+    while (ys.isNotEmpty || ns.isNotEmpty) {
+      if (ys.isNotEmpty) {
+        out.add(ys.removeAt(0));
+      } else if (ns.isNotEmpty) {
+        out.add(ns.removeAt(0));
+      }
+
+      if (out.length.isOdd) {
+        final firstIsYt = out.isNotEmpty && out.last.hasYoutube;
+        if (firstIsYt && ns.isNotEmpty) {
+          out.add(ns.removeAt(0));
+        } else if (ns.isNotEmpty) {
+          out.add(ns.removeAt(0));
+        } else if (ys.isNotEmpty) {
+          out.add(ys.removeAt(0));
+        }
+      }
+    }
+
+    return out;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final view = _arrangeNoDoubleYoutube(widget.items);
+    _activeId ??= view.isNotEmpty ? view.first.id : null;
+
+    return CustomScrollView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      slivers: [
+        const SliverPadding(padding: EdgeInsets.only(top: 8)),
+        SliverPadding(
+          padding: EdgeInsets.fromLTRB(
+            12,
+            0,
+            12,
+            MediaQuery.of(context).padding.bottom + 90.0,
+          ),
+          sliver: SliverGrid(
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 2,
+              crossAxisSpacing: 12,
+              mainAxisSpacing: 12,
+              childAspectRatio: 0.78,
+            ),
+            delegate: SliverChildBuilderDelegate((context, i) {
+              final it = view[i];
+              return VisibilityDetector(
+                key: Key('search-${it.id}'),
+                onVisibilityChanged: (info) =>
+                    _onVisible(it.id, info.visibleFraction),
+                child: _Card(
+                  item: it,
+                  active: _activeId == it.id,
+                  onTap: () => widget.onTapItem(it),
+                ),
+              );
+            }, childCount: view.length),
+          ),
+        ),
+        if (widget.loading)
+          const SliverToBoxAdapter(
+            child: Padding(
+              padding: EdgeInsets.symmetric(vertical: 16),
+              child: Center(child: CircularProgressIndicator()),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _Card extends StatelessWidget {
+  const _Card({required this.item, required this.active, required this.onTap});
+
+  final SearchItem item;
+  final bool active;
+  final VoidCallback onTap;
+
+  String? _thumbOf(SearchItem item) {
+    final raw = item.thumbUrl?.trim();
+    if (raw != null && raw.isNotEmpty) {
+      return gwFixMediaUrl(raw) ?? raw;
+    }
+    final vid = item.videoId?.trim();
+    if (item.hasYoutube && vid != null && vid.isNotEmpty) {
+      return gwYoutubeThumbFromSrc(vid);
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    final hasVideo =
+        item.hasYoutube && (item.videoId?.trim().isNotEmpty ?? false);
+    final vid = item.videoId?.trim();
+    final thumb = _thumbOf(item);
+
+    Widget media;
+
+    if (hasVideo && active && vid != null) {
+      // ✅ スクロール最優先：動画がタッチを奪わない
+      media = RepaintBoundary(
+        child: ClipRect(
+          child: IgnorePointer(
+            ignoring: true,
+            child: GwYoutubePlayer(
+              videoId: vid,
+              autoplay: true,
+              mute: true,
+              showYoutubeControls: false,
+              enableTapToPlay: false,
+              showOverlaySeek: false,
+              aspectRatio: 16 / 9,
+              useCard: false,
+            ),
+          ),
+        ),
+      );
+    } else if (thumb != null && thumb.isNotEmpty) {
+      media = CachedNetworkImage(
+        imageUrl: thumb,
+        fit: BoxFit.cover,
+        placeholder: (_, __) => const ColoredBox(color: Colors.black12),
+        errorWidget: (_, __, ___) => const ColoredBox(color: Colors.black12),
+      );
+    } else {
+      media = Container(
+        color: cs.surfaceContainerHighest,
+        child: Center(
+          child: Icon(
+            Icons.image_not_supported_outlined,
+            color: cs.onSurfaceVariant,
+          ),
+        ),
+      );
+    }
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Ink(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(14),
+          color: cs.surface,
+          border: Border.all(color: Theme.of(context).dividerColor),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: ClipRRect(
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(14),
+                ),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    media,
+                    if (hasVideo)
+                      Positioned(
+                        left: 8,
+                        bottom: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(999),
+                            color: Colors.black.withOpacity(0.55),
+                          ),
+                          child: Text(
+                            active ? 'PLAY' : 'YT',
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+              child: Text(
+                item.name,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+              child: Text(
+                item.base,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.labelSmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

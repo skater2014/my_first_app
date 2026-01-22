@@ -1,0 +1,173 @@
+import 'package:flutter/material.dart';
+import 'package:visibility_detector/visibility_detector.dart';
+import 'package:youtube_player_iframe/youtube_player_iframe.dart';
+
+/// ============================================================
+/// GwYoutubePlayer（“触れないYouTube” + スクロールで自動再生）
+///
+/// 目的：
+/// - YouTubeがジェスチャー（縦スクロール/横スワイプ）を奪うのを防ぐ
+/// - “ボタン再生”を排除し、見えてる時だけ自動再生・見えなくなったら停止
+///
+/// ポイント：
+/// - enableTapToPlay=false → IgnorePointerでYouTubeを触れない（親がスクロール/スワイプ可能）
+/// - autoPlayOnVisible=true → 画面に一定割合見えたら play / 見えなくなったら pause
+/// ============================================================
+class GwYoutubePlayer extends StatefulWidget {
+  const GwYoutubePlayer({
+    super.key,
+    required this.videoId,
+
+    /// これ自体は「再生していいか」のフラグ（見えてない時は勝手に再生しない）
+    this.autoplay = false,
+
+    /// Webの自動再生は基本ミュート必須（ブロックされる）
+    this.mute = true,
+
+    /// YouTube標準コントロールを表示するか（要らないなら false）
+    this.showYoutubeControls = false,
+
+    /// trueにするとYouTubeがタップ/ドラッグを食う（＝スクロールが死ぬ）
+    /// 今回は「いらない」ので基本 false で運用
+    this.enableTapToPlay = false,
+
+    /// 見えてる時だけ自動再生する（Instagram風）
+    this.autoPlayOnVisible = false,
+
+    /// 何割見えたら再生するか（0.6=60%）
+    this.visibleFractionToPlay = 0.60,
+
+    this.aspectRatio = 16 / 9,
+    this.useCard = true,
+  });
+
+  final String videoId;
+  final bool autoplay;
+  final bool mute;
+
+  final bool showYoutubeControls;
+  final bool enableTapToPlay;
+
+  final bool autoPlayOnVisible;
+  final double visibleFractionToPlay;
+
+  final double aspectRatio;
+  final bool useCard;
+
+  @override
+  State<GwYoutubePlayer> createState() => _GwYoutubePlayerState();
+}
+
+class _GwYoutubePlayerState extends State<GwYoutubePlayer> {
+  late YoutubePlayerController _c;
+
+  bool _visibleEnough = true; // autoPlayOnVisible=false の時は無視
+
+  @override
+  void initState() {
+    super.initState();
+
+    _c = YoutubePlayerController.fromVideoId(
+      videoId: widget.videoId,
+      params: YoutubePlayerParams(
+        mute: widget.mute,
+        showControls: widget.showYoutubeControls,
+        showFullscreenButton: false,
+        enableJavaScript: true,
+        playsInline: true,
+        strictRelatedVideos: true,
+      ),
+    );
+
+    // 初期状態の再生制御（“Readyになった瞬間pause”みたいな強制はしない）
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _applyPlayPolicy();
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant GwYoutubePlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (oldWidget.videoId != widget.videoId) {
+      _c.loadVideoById(videoId: widget.videoId);
+    }
+
+    if (oldWidget.mute != widget.mute) {
+      widget.mute ? _c.mute() : _c.unMute();
+    }
+
+    // autoplay フラグが変わったらポリシー反映
+    if (oldWidget.autoplay != widget.autoplay ||
+        oldWidget.autoPlayOnVisible != widget.autoPlayOnVisible ||
+        oldWidget.visibleFractionToPlay != widget.visibleFractionToPlay) {
+      _applyPlayPolicy();
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.close();
+    super.dispose();
+  }
+
+  void _applyPlayPolicy() {
+    // autoPlayOnVisible=true の時は “見えてるか” が最優先
+    final canPlay = widget.autoplay &&
+        (!widget.autoPlayOnVisible || _visibleEnough);
+
+    if (canPlay) {
+      _c.playVideo();
+    } else {
+      _c.pauseVideo();
+    }
+  }
+
+  Widget _player() {
+    // enableTapToPlay=false → YouTubeを触れなくして、親のスクロール/スワイプを生かす
+    Widget p = YoutubePlayer(controller: _c, aspectRatio: widget.aspectRatio);
+
+    if (!widget.enableTapToPlay) {
+      p = IgnorePointer(ignoring: true, child: p);
+    }
+    return p;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final vid = widget.videoId.trim();
+    if (vid.isEmpty) return const SizedBox.shrink();
+
+    Widget body = AspectRatio(
+      aspectRatio: widget.aspectRatio,
+      child: ClipRect(child: _player()),
+    );
+
+    if (widget.useCard) {
+      body = Material(
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: body,
+      );
+    }
+
+    // “スクロールで自動再生” を有効化する場合だけ VisibilityDetector を噛ませる
+    if (widget.autoPlayOnVisible) {
+      body = VisibilityDetector(
+        key: ValueKey('yt-visible-$vid'),
+        onVisibilityChanged: (info) {
+          final frac = info.visibleFraction.clamp(0.0, 1.0);
+          final next = frac >= widget.visibleFractionToPlay;
+
+          if (next != _visibleEnough) {
+            _visibleEnough = next;
+            _applyPlayPolicy(); // 見えた→play / 見えない→pause
+          }
+        },
+        child: body,
+      );
+    }
+
+    return body;
+  }
+}

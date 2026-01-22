@@ -1,0 +1,137 @@
+import 'package:flutter/material.dart';
+import 'package:youtube_player_iframe/youtube_player_iframe.dart';
+
+/// GwYoutubePlayer（iframe版）
+///
+/// ✅ 役割（初心者向け）
+/// - YouTubeの再生表示を「必ず有限の高さ」で描画する（AspectRatio）
+///   → List/Sliver/Gridの中で “高さInfinityで落ちる” を防ぐ
+/// - 「動画がタッチ/スワイプを奪う」問題を制御する
+///   → enableTapToPlay=false なら YouTube側に指イベントを渡さない
+/// - autoplay=true の時だけ再生する（Readyで勝手にpause/playはしない）
+/// - Widget破棄（スライド移動など）で stop して確実に止める
+class GwYoutubePlayer extends StatefulWidget {
+  const GwYoutubePlayer({
+    super.key,
+    required this.videoId,
+    this.autoplay = false,
+    this.mute = true,
+    this.showYoutubeControls = true,
+
+    /// ✅ ここが重要
+    /// false: 画面の左右スワイプを最優先（YouTubeがイベントを奪わない）
+    /// true : 動画をタップして操作したい時
+    this.enableTapToPlay = true,
+
+    this.showOverlaySeek = true,
+    this.aspectRatio = 16 / 9,
+    this.useCard = true,
+  });
+
+  final String videoId;
+  final bool autoplay;
+  final bool mute;
+
+  final bool showYoutubeControls;
+  final bool enableTapToPlay;
+  final bool showOverlaySeek;
+
+  final double aspectRatio;
+  final bool useCard;
+
+  @override
+  State<GwYoutubePlayer> createState() => _GwYoutubePlayerState();
+}
+
+class _GwYoutubePlayerState extends State<GwYoutubePlayer> {
+  late YoutubePlayerController _c;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _c = YoutubePlayerController.fromVideoId(
+      videoId: widget.videoId,
+      params: YoutubePlayerParams(
+        mute: widget.mute,
+        showControls: widget.showYoutubeControls,
+        showFullscreenButton: false,
+        enableJavaScript: true,
+        playsInline: true,
+        strictRelatedVideos: true,
+
+        /// ✅ Webで特に効く：iframeがスワイプを奪うのを止める
+        pointerEvents: widget.enableTapToPlay
+            ? PointerEvents.initial
+            : PointerEvents.none,
+      ),
+    );
+
+    /// ✅ “勝手にReadyでpause/play”はしない
+    /// autoplay=true の時だけ再生する
+    if (widget.autoplay) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _c.playVideo();
+      });
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant GwYoutubePlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    /// ✅ videoIdが変わったら前の動画を止めて切り替え
+    if (oldWidget.videoId != widget.videoId) {
+      _c.stopVideo();
+      _c.loadVideoById(videoId: widget.videoId);
+      if (widget.autoplay) _c.playVideo();
+    }
+
+    /// ✅ muteは変更に追従
+    if (oldWidget.mute != widget.mute) {
+      widget.mute ? _c.mute() : _c.unMute();
+    }
+
+    /// ✅ autoplayのON/OFFに追従（不要な時だけ止める）
+    if (oldWidget.autoplay != widget.autoplay && !widget.autoplay) {
+      _c.pauseVideo();
+    }
+    if (oldWidget.autoplay != widget.autoplay && widget.autoplay) {
+      _c.playVideo();
+    }
+  }
+
+  @override
+  void dispose() {
+    /// ✅ スライド移動などで破棄されたら確実に停止
+    _c.stopVideo();
+    _c.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final vid = widget.videoId.trim();
+    if (vid.isEmpty) return const SizedBox.shrink();
+
+    /// ✅ enableTapToPlay=false の時は Flutter側ジェスチャーを最優先（iOS/Androidの保険）
+    final player = IgnorePointer(
+      ignoring: !widget.enableTapToPlay,
+      child: YoutubePlayer(controller: _c, aspectRatio: widget.aspectRatio),
+    );
+
+    Widget body = AspectRatio(
+      aspectRatio: widget.aspectRatio,
+      child: ClipRect(child: player),
+    );
+
+    if (widget.useCard) {
+      body = Material(
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: body,
+      );
+    }
+    return body;
+  }
+}
