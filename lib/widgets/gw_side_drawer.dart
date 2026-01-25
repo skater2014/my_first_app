@@ -39,16 +39,10 @@ class GwSideDrawer extends StatelessWidget {
               title: const Text('Search'),
               onTap: () => Navigator.pop(context),
             ),
-            ListTile(
-              leading: const Icon(Icons.apps),
-              title: const Text('Categories'),
-              onTap: () => Navigator.pop(context),
-            ),
-            ListTile(
-              leading: const Icon(Icons.favorite),
-              title: const Text('Likes'),
-              onTap: () => Navigator.pop(context),
-            ),
+
+            // アイコン無しにするなら leading を消す（または null）
+            ListTile(title: const Text('Categories'), onTap: () => Navigator.pop(context)),
+            ListTile(title: const Text('Likes'), onTap: () => Navigator.pop(context)),
 
             const Divider(),
 
