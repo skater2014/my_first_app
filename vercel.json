@@ -1,6 +1,5 @@
 {
-  "framework": "other",
-  "buildCommand": "git clone https://github.com/flutter/flutter.git --depth 1 -b stable flutter && export PATH=\"$PWD/flutter/bin:$PATH\" && flutter pub get && flutter build web --release",
+  "buildCommand": "bash -lc 'set -euo pipefail; git clone https://github.com/flutter/flutter.git --depth 1 -b stable flutter; export PATH=\"$(pwd)/flutter/bin:$PATH\"; flutter config --enable-web; flutter pub get; flutter build web --release'",
   "outputDirectory": "build/web",
   "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
