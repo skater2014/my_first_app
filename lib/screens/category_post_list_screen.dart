@@ -1,3 +1,4 @@
+// Genshin_Character_Detail_Screen.dart
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 
@@ -12,11 +13,7 @@ class CategoryPostListScreen extends StatefulWidget {
   final String categorySlug;
   final String? title;
 
-  const CategoryPostListScreen({
-    super.key,
-    required this.categorySlug,
-    this.title,
-  });
+  const CategoryPostListScreen({super.key, required this.categorySlug, this.title});
 
   @override
   State<CategoryPostListScreen> createState() => _CategoryPostListScreenState();
@@ -87,15 +84,10 @@ class _CategoryPostListScreenState extends State<CategoryPostListScreen> {
     bool belongs(Post p) {
       try {
         final uri = Uri.parse(p.link);
-        final segments = uri.path
-            .split('/')
-            .where((s) => s.isNotEmpty)
-            .toList();
+        final segments = uri.path.split('/').where((s) => s.isNotEmpty).toList();
 
-        if (slug == 'genshin-impact')
-          return segments.contains('genshin-impact');
-        if (slug == 'genshin_updated')
-          return segments.contains('genshin_updated');
+        if (slug == 'genshin-impact') return segments.contains('genshin-impact');
+        if (slug == 'genshin_updated') return segments.contains('genshin_updated');
         if (slug == 'tekken7') return segments.contains('tekken7');
 
         return p.link.contains(slug);
@@ -123,9 +115,7 @@ class _CategoryPostListScreenState extends State<CategoryPostListScreen> {
       onTap: () {
         // ★ ここで PostDetailScreen に push している
         // だから PostDetailScreen 側にも screen_view を入れると「記事詳細」も追える
-        Navigator.of(
-          context,
-        ).push(MaterialPageRoute(builder: (_) => PostDetailScreen(post: post)));
+        Navigator.of(context).push(MaterialPageRoute(builder: (_) => PostDetailScreen(post: post)));
       },
       borderRadius: BorderRadius.circular(14),
       child: Card(
@@ -135,19 +125,15 @@ class _CategoryPostListScreenState extends State<CategoryPostListScreen> {
           children: [
             if (thumb != null)
               ClipRRect(
-                borderRadius: const BorderRadius.horizontal(
-                  left: Radius.circular(14),
-                ),
+                borderRadius: const BorderRadius.horizontal(left: Radius.circular(14)),
                 child: SizedBox(
                   width: 120,
                   height: 86,
                   child: CachedNetworkImage(
                     imageUrl: thumb,
                     fit: BoxFit.cover,
-                    placeholder: (_, __) =>
-                        const Center(child: CircularProgressIndicator()),
-                    errorWidget: (_, __, ___) =>
-                        const Center(child: Icon(Icons.broken_image)),
+                    placeholder: (_, __) => const Center(child: CircularProgressIndicator()),
+                    errorWidget: (_, __, ___) => const Center(child: Icon(Icons.broken_image)),
                   ),
                 ),
               )
@@ -158,9 +144,7 @@ class _CategoryPostListScreenState extends State<CategoryPostListScreen> {
                 alignment: Alignment.center,
                 decoration: BoxDecoration(
                   color: Colors.grey.shade200,
-                  borderRadius: const BorderRadius.horizontal(
-                    left: Radius.circular(14),
-                  ),
+                  borderRadius: const BorderRadius.horizontal(left: Radius.circular(14)),
                 ),
                 child: const Icon(Icons.article, size: 28),
               ),
@@ -174,18 +158,12 @@ class _CategoryPostListScreenState extends State<CategoryPostListScreen> {
                       post.title,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.bold,
-                      ),
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
                     ),
                     const SizedBox(height: 6),
                     Text(
                       '${post.date.toLocal()}'.split(' ').first,
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: Colors.grey.shade600,
-                      ),
+                      style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
                     ),
                     if (excerpt.isNotEmpty) ...[
                       const SizedBox(height: 6),
@@ -193,11 +171,7 @@ class _CategoryPostListScreenState extends State<CategoryPostListScreen> {
                         excerpt,
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey.shade700,
-                          height: 1.3,
-                        ),
+                        style: TextStyle(fontSize: 12, color: Colors.grey.shade700, height: 1.3),
                       ),
                     ],
                   ],
@@ -212,10 +186,8 @@ class _CategoryPostListScreenState extends State<CategoryPostListScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final title = widget.title ?? widget.categorySlug;
-
     return Scaffold(
-      appBar: AppBar(title: Text(title)),
+      appBar: AppBar(title: Text(widget.title ?? widget.categorySlug)),
       body: RefreshIndicator(
         onRefresh: _reload,
         child: FutureBuilder<List<Post>>(

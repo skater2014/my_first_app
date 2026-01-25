@@ -10,94 +10,73 @@ class GwcCategoryInfo {
   final String nameJa;
   final IconData icon;
 
-  const GwcCategoryInfo({
-    required this.slug,
-    required this.nameJa,
-    required this.icon,
-  });
+  const GwcCategoryInfo({required this.slug, required this.nameJa, required this.icon});
 }
 
 const gwcCategories = <GwcCategoryInfo>[
-  GwcCategoryInfo(
-    slug: 'genshin-impact',
-    nameJa: 'Genshin Impact 全体',
-    icon: Icons.videogame_asset,
-  ),
-  GwcCategoryInfo(
-    slug: 'genshin_updated',
-    nameJa: 'Genshin Updated',
-    icon: Icons.update,
-  ),
-  GwcCategoryInfo(
-    slug: 'tekken7',
-    nameJa: 'TEKKEN 7',
-    icon: Icons.sports_martial_arts,
-  ),
+  GwcCategoryInfo(slug: 'genshin-impact', nameJa: 'Genshin Impact 全体', icon: Icons.videogame_asset),
+  GwcCategoryInfo(slug: 'genshin_updated', nameJa: 'Genshin Updated', icon: Icons.update),
+  GwcCategoryInfo(slug: 'tekken7', nameJa: 'TEKKEN 7', icon: Icons.sports_martial_arts),
 ];
 
+/// ✅ MainShellの body に入る前提
+/// - ここは Scaffold / AppBar を持たない（MainShell側に任せる）
 class CategoriesScreen extends StatelessWidget {
   const CategoriesScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Categories')),
-      body: GridView.count(
-        padding: const EdgeInsets.all(12),
-        crossAxisCount: 2,
-        crossAxisSpacing: 12,
-        mainAxisSpacing: 12,
-        childAspectRatio: 3 / 2,
-        children: [
-          for (final cat in gwcCategories)
-            InkWell(
-              borderRadius: BorderRadius.circular(16),
-              onTap: () {
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) =>
-                        CategoryPostsScreen(slug: cat.slug, title: cat.nameJa),
-                  ),
-                );
-              },
-              child: Card(
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16),
+    return GridView.count(
+      padding: const EdgeInsets.all(12),
+      crossAxisCount: 2,
+      crossAxisSpacing: 12,
+      mainAxisSpacing: 12,
+      childAspectRatio: 3 / 2,
+      children: [
+        for (final cat in gwcCategories)
+          InkWell(
+            borderRadius: BorderRadius.circular(16),
+            onTap: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => CategoryPostsScreen(slug: cat.slug, title: cat.nameJa),
                 ),
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(cat.icon, size: 28),
-                      const SizedBox(height: 8),
-                      Text(
-                        cat.nameJa,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontWeight: FontWeight.bold),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        cat.slug,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: Colors.grey,
-                        ),
-                      ),
-                    ],
-                  ),
+              );
+            },
+            child: Card(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(cat.icon, size: 28),
+                    const SizedBox(height: 8),
+                    Text(
+                      cat.nameJa,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      cat.slug,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 11, color: Colors.grey),
+                    ),
+                  ],
                 ),
               ),
             ),
-        ],
-      ),
+          ),
+      ],
     );
   }
 }
 
+/// ✅ pushで開く“別画面”
+/// - これは MainShell の外側に乗るので、Scaffold / AppBar が必要
 class CategoryPostsScreen extends StatefulWidget {
   final String slug;
   final String? title;
@@ -111,11 +90,6 @@ class CategoryPostsScreen extends StatefulWidget {
 class _CategoryPostsScreenState extends State<CategoryPostsScreen> {
   final _api = WpApiService();
   late Future<List<Post>> _futurePosts;
-
-  void _safeSetState(VoidCallback fn) {
-    if (!mounted) return;
-    setState(fn);
-  }
 
   @override
   void initState() {
@@ -152,7 +126,7 @@ class _CategoryPostsScreenState extends State<CategoryPostsScreen> {
   }
 
   Future<void> _reload() async {
-    _safeSetState(() {
+    setState(() {
       _futurePosts = _load();
     });
   }
@@ -197,37 +171,29 @@ class _CategoryPostsScreenState extends State<CategoryPostsScreen> {
 
                 return InkWell(
                   onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => PostDetailScreen(post: post),
-                      ),
-                    );
+                    Navigator.of(
+                      context,
+                    ).push(MaterialPageRoute(builder: (_) => PostDetailScreen(post: post)));
                   },
                   borderRadius: BorderRadius.circular(12),
                   child: Card(
                     margin: const EdgeInsets.only(bottom: 12),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     child: Row(
                       children: [
                         if (thumbUrl != null)
                           ClipRRect(
-                            borderRadius: const BorderRadius.horizontal(
-                              left: Radius.circular(12),
-                            ),
+                            borderRadius: const BorderRadius.horizontal(left: Radius.circular(12)),
                             child: SizedBox(
                               width: 110,
                               height: 80,
                               child: CachedNetworkImage(
                                 imageUrl: thumbUrl,
                                 fit: BoxFit.cover,
-                                placeholder: (_, __) => const Center(
-                                  child: CircularProgressIndicator(),
-                                ),
-                                errorWidget: (_, __, ___) => const Center(
-                                  child: Icon(Icons.broken_image),
-                                ),
+                                placeholder: (_, __) =>
+                                    const Center(child: CircularProgressIndicator()),
+                                errorWidget: (_, __, ___) =>
+                                    const Center(child: Icon(Icons.broken_image)),
                               ),
                             ),
                           )
@@ -235,9 +201,7 @@ class _CategoryPostsScreenState extends State<CategoryPostsScreen> {
                           const SizedBox(
                             width: 110,
                             height: 80,
-                            child: Center(
-                              child: Icon(Icons.image_not_supported),
-                            ),
+                            child: Center(child: Icon(Icons.image_not_supported)),
                           ),
                         const SizedBox(width: 8),
                         Expanded(
@@ -250,18 +214,12 @@ class _CategoryPostsScreenState extends State<CategoryPostsScreen> {
                                   post.title,
                                   maxLines: 2,
                                   overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.bold,
-                                  ),
+                                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
                                 ),
                                 const SizedBox(height: 4),
                                 Text(
                                   '${post.date.toLocal()}'.split(' ').first,
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: Colors.grey.shade600,
-                                  ),
+                                  style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
                                 ),
                               ],
                             ),

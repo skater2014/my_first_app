@@ -1,3 +1,4 @@
+// lib/screens/post_detail_screen.dart
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:youtube_player_flutter/youtube_player_flutter.dart';
@@ -7,12 +8,27 @@ import '../model/comment.dart';
 import '../model/banner.dart';
 import '../service/wp_api_service.dart';
 import '../widgets/wp_tables.dart';
-import 'category_post_list_screen.dart';
 import '../widgets/gw_post_slider.dart';
 
+import 'category_post_list_screen.dart';
+
+/// ============================================================
+/// PostDetailScreen（記事詳細）
+///
+/// ✅ 仕様
+/// - 詳細画面は「戻る」だけ（Drawer/ハンバーガーは出さない）
+/// - 上部は動画（YouTube）or 画像 or 記事スライダー
+/// - 下部にコメント表示
+/// - 一定スクロールでスクロールバナーを下に表示
+///
+/// ✅ なぜ AppBar を普通にしてる？
+/// - いまの GwTopHeader は「menu（Drawer）」前提で作ってる
+/// - 詳細では Drawer ではなく Back が欲しいので、まずは安定優先で AppBar を使う
+///   （後で GwTopHeader に leadingMode=back を追加して統一してもOK）
+/// ============================================================
 class PostDetailScreen extends StatefulWidget {
   final Post post;
-  const PostDetailScreen({Key? key, required this.post}) : super(key: key);
+  const PostDetailScreen({super.key, required this.post});
 
   @override
   State<PostDetailScreen> createState() => _PostDetailScreenState();
@@ -22,8 +38,8 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
   final _api = WpApiService();
   final _scrollController = ScrollController();
 
-  late Future<ScrollBanner?> _bannerFuture;
-  late Future<List<Comment>> _commentsFuture;
+  late final Future<ScrollBanner?> _bannerFuture;
+  late final Future<List<Comment>> _commentsFuture;
 
   ScrollBanner? _banner;
   bool _bannerVisible = false;
@@ -31,11 +47,17 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
 
   YoutubePlayerController? _ytController;
 
+  // -------------------------
+  // 安全に setState（dispose後対策）
+  // -------------------------
   void _safeSetState(VoidCallback fn) {
     if (!mounted) return;
     setState(fn);
   }
 
+  // -------------------------
+  // 日付表示
+  // -------------------------
   String get formattedDate {
     final d = widget.post.date.toLocal();
     String two(int n) => n.toString().padLeft(2, '0');
@@ -48,29 +70,36 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
     return '${d.year}/${two(d.month)}/${two(d.day)} ${two(d.hour)}:${two(d.minute)}';
   }
 
+  // -------------------------
+  // YouTube
+  // -------------------------
   String? get _videoIdOrNull {
     final raw = widget.post.youtubeId ?? widget.post.pageVideoId;
     if (raw == null) return null;
     final t = raw.trim();
     if (t.isEmpty) return null;
-    return YoutubePlayer.convertUrlToId(t) ?? t;
+    return YoutubePlayer.convertUrlToId(t) ?? t; // URLでもIDでも対応
   }
 
   bool get _hasVideo => _videoIdOrNull != null;
 
+  // -------------------------
+  // 画像URL（AVIF回避）
+  // -------------------------
   String? _safeImageUrl(String? url) {
     if (url == null || url.isEmpty) return null;
     final u = url.toLowerCase().split('?').first;
-    if (u.endsWith('.avif')) return null; // ✅ AVIFは表示できない端末多い
+    if (u.endsWith('.avif')) return null;
     return url;
   }
 
+  // -------------------------
+  // スクロールでバナー表示切替
+  // -------------------------
   void _handleScroll() {
     if (_banner == null) return;
 
-    final show =
-        _scrollController.hasClients &&
-        _scrollController.offset >= _bannerThreshold;
+    final show = _scrollController.hasClients && _scrollController.offset >= _bannerThreshold;
 
     if (show != _bannerVisible) {
       _safeSetState(() => _bannerVisible = show);
@@ -83,29 +112,24 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
 
     _scrollController.addListener(_handleScroll);
 
+    // YouTube
     if (_hasVideo) {
       final id = _videoIdOrNull!;
       _ytController = YoutubePlayerController(
         initialVideoId: id,
-        flags: const YoutubePlayerFlags(
-          autoPlay: false,
-          mute: false,
-          enableCaption: true,
-        ),
+        flags: const YoutubePlayerFlags(autoPlay: false, mute: false, enableCaption: true),
       );
     }
 
-    // ✅ dispose後 setState 対策（then内は必ず safeSetState）
+    // スクロールバナー
     _bannerFuture = _api.fetchScrollBanner().then((b) {
       if (!mounted) return b;
-
       _safeSetState(() {
         _banner = b;
-        if (b != null) {
-          _bannerThreshold = b.scrollStart.toDouble();
-        }
+        if (b != null) _bannerThreshold = b.scrollStart.toDouble();
       });
 
+      // 初回描画後に状態反映
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         _handleScroll();
@@ -114,6 +138,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
       return b;
     });
 
+    // コメント
     _commentsFuture = _api.fetchComments(widget.post.id);
   }
 
@@ -125,6 +150,9 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
     super.dispose();
   }
 
+  // -------------------------
+  // コメントUI
+  // -------------------------
   Widget _commentTile(Comment c) {
     return Container(
       padding: const EdgeInsets.all(12),
@@ -157,6 +185,9 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
     );
   }
 
+  // -------------------------
+  // バナー用：色
+  // -------------------------
   Color _parseHexColor(String hex, {Color fallback = Colors.black}) {
     try {
       var v = hex.replaceAll('#', '').trim();
@@ -185,11 +216,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
   TextStyle _bannerTextStyle(ScrollBanner b) {
     final f = b.fontStyle;
     if (f == null) {
-      return const TextStyle(
-        fontSize: 14,
-        fontWeight: FontWeight.bold,
-        color: Colors.white,
-      );
+      return const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white);
     }
     return TextStyle(
       fontSize: f.size,
@@ -198,15 +225,16 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
     );
   }
 
+  // -------------------------
+  // バナー押したらカテゴリへ
+  // -------------------------
   void _onBannerTap(ScrollBanner b) {
     final link = (b.link ?? '').trim();
     if (link.isEmpty) return;
 
     final slug = _extractCategorySlugFromLink(link);
     if (slug == null || slug.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('カテゴリに変換できないリンクです')));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('カテゴリに変換できないリンクです')));
       return;
     }
 
@@ -222,12 +250,9 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
 
   String? _extractCategorySlugFromLink(String link) {
     try {
-      final Uri uri =
-          (link.startsWith('http://') || link.startsWith('https://'))
+      final Uri uri = (link.startsWith('http://') || link.startsWith('https://'))
           ? Uri.parse(link)
-          : Uri.parse(
-              'https://dummy.local/${link.startsWith('/') ? link.substring(1) : link}',
-            );
+          : Uri.parse('https://dummy.local/${link.startsWith('/') ? link.substring(1) : link}');
 
       final seg = uri.pathSegments.where((s) => s.isNotEmpty).toList();
       final idx = seg.indexOf('category');
@@ -266,10 +291,8 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                       child: CachedNetworkImage(
                         imageUrl: b.imageUrl!,
                         fit: BoxFit.cover,
-                        placeholder: (_, __) =>
-                            const Center(child: CircularProgressIndicator()),
-                        errorWidget: (_, __, ___) =>
-                            const Center(child: Icon(Icons.broken_image)),
+                        placeholder: (_, __) => const Center(child: CircularProgressIndicator()),
+                        errorWidget: (_, __, ___) => const Center(child: Icon(Icons.broken_image)),
                       ),
                     ),
                   const SizedBox(width: 10),
@@ -297,14 +320,14 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
     );
   }
 
+  // -------------------------
+  // 上部メディア（動画/画像）
+  // -------------------------
   Widget _headerMedia() {
     if (_hasVideo && _ytController != null) {
       return AspectRatio(
         aspectRatio: 16 / 9,
-        child: YoutubePlayer(
-          controller: _ytController!,
-          showVideoProgressIndicator: true,
-        ),
+        child: YoutubePlayer(controller: _ytController!, showVideoProgressIndicator: true),
       );
     }
 
@@ -317,10 +340,8 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
           child: CachedNetworkImage(
             imageUrl: img,
             fit: BoxFit.cover,
-            placeholder: (_, __) =>
-                const Center(child: CircularProgressIndicator()),
-            errorWidget: (_, __, ___) =>
-                const Center(child: Icon(Icons.broken_image)),
+            placeholder: (_, __) => const Center(child: CircularProgressIndicator()),
+            errorWidget: (_, __, ___) => const Center(child: Icon(Icons.broken_image)),
           ),
         ),
       );
@@ -333,24 +354,17 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
   Widget build(BuildContext context) {
     final html = widget.post.contentHtml;
 
-    debugPrint(
-      'sliderItems=${widget.post.sliderItems.length} postId=${widget.post.id}',
-    );
-
-    // ✅ 追加：記事スライダー配列（無い記事は []）
+    // 記事スライダー
     final sliderItems = widget.post.sliderItems;
-
-    // ✅ 判定（スライダーがあるか）
     final hasPostSlider = sliderItems.isNotEmpty;
 
     return Scaffold(
+      // ✅ 詳細は「戻る」だけ（Drawerなし）
       appBar: AppBar(
-        title: Text(
-          widget.post.title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
+        leading: const BackButton(),
+        title: Text(widget.post.title, maxLines: 1, overflow: TextOverflow.ellipsis),
       ),
+
       body: SafeArea(
         child: Stack(
           children: [
@@ -360,14 +374,12 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // ✅ ここで判別して差し込む
-                  if (hasPostSlider)
-                    GwPostSlider(items: sliderItems)
-                  else
-                    _headerMedia(),
+                  // 上部：スライダーがあればスライダー、なければ動画/画像
+                  if (hasPostSlider) GwPostSlider(items: sliderItems) else _headerMedia(),
 
                   const SizedBox(height: 12),
 
+                  // タイトル周り
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16.0),
                     child: Column(
@@ -375,14 +387,16 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                       children: [
                         Text(
                           formattedDate,
-                          style: Theme.of(context).textTheme.bodySmall
-                              ?.copyWith(color: Colors.grey[600]),
+                          style: Theme.of(
+                            context,
+                          ).textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
                         ),
                         const SizedBox(height: 4),
                         Text(
                           widget.post.title,
-                          style: Theme.of(context).textTheme.titleLarge
-                              ?.copyWith(fontWeight: FontWeight.bold),
+                          style: Theme.of(
+                            context,
+                          ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
                         ),
                       ],
                     ),
@@ -392,7 +406,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                   const Divider(height: 1),
                   const SizedBox(height: 8),
 
-                  // ✅ 本文：WpHtmlView が「TablePress画像 / lazy画像 / AVIF削除 / 折り返し」を全部面倒見る
+                  // 本文（HTML）
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16.0),
                     child: WpHtmlView(html: html),
@@ -401,16 +415,18 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                   const SizedBox(height: 24),
                   const Divider(height: 1),
 
+                  // コメント見出し
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
                     child: Text(
                       'コメント',
-                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.bold,
-                      ),
+                      style: Theme.of(
+                        context,
+                      ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
                     ),
                   ),
 
+                  // コメント一覧
                   FutureBuilder<List<Comment>>(
                     future: _commentsFuture,
                     builder: (context, snapshot) {
@@ -430,10 +446,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                       final comments = snapshot.data ?? [];
                       if (comments.isEmpty) {
                         return const Padding(
-                          padding: EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
-                          ),
+                          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                           child: Text('まだコメントはありません。'),
                         );
                       }
@@ -444,8 +457,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                           children: [
                             for (int i = 0; i < comments.length; i++) ...[
                               _commentTile(comments[i]),
-                              if (i != comments.length - 1)
-                                const SizedBox(height: 10),
+                              if (i != comments.length - 1) const SizedBox(height: 10),
                             ],
                           ],
                         ),
@@ -456,6 +468,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
               ),
             ),
 
+            // 画面下のスクロールバナー（一定スクロールで表示）
             FutureBuilder<ScrollBanner?>(
               future: _bannerFuture,
               builder: (context, snapshot) {
@@ -464,10 +477,7 @@ class _PostDetailScreenState extends State<PostDetailScreen> {
                 if (!b.shouldShow) return const SizedBox.shrink();
                 if (!_bannerVisible) return const SizedBox.shrink();
 
-                return Align(
-                  alignment: Alignment.bottomCenter,
-                  child: _bannerWidget(b),
-                );
+                return Align(alignment: Alignment.bottomCenter, child: _bannerWidget(b));
               },
             ),
           ],

@@ -8,6 +8,21 @@ import '../service/wp_api_service.dart';
 import '../store/like_store.dart';
 import 'post_detail_screen.dart';
 
+/// ============================================================
+/// TimelineScreen（ホームのタイムライン）
+///
+/// ✅やっていること
+/// - 投稿一覧を表示する（FutureBuilder）
+/// - 動画がある投稿は「一番見えてる1件だけ」自動再生する
+/// - いいねは「押した瞬間に +1 / -1 で即反映」
+///   → サーバー通信が終わったらサーバーの値で確定
+///   → 失敗したら元に戻す
+///
+/// ✅ポイント
+/// - いいね押したときに _reload()（全リロード）しない
+///   → それが「毎回リロードが邪魔」の原因だった
+/// - いいねの処理は関数 _handleLikePressed() にまとめる
+/// ============================================================
 class TimelineScreen extends StatefulWidget {
   const TimelineScreen({super.key});
 
@@ -24,13 +39,21 @@ class _TimelineScreenState extends State<TimelineScreen> {
     setState(fn);
   }
 
+  // -----------------------
+  // 動画：一番見えてる投稿ID（1件だけ再生）
+  // -----------------------
   int? _activePostId;
   final Map<int, double> _visibleMapByPostId = {};
+  final Map<int, YoutubePlayerController> _ytControllers = {};
 
+  // -----------------------
+  // いいね：送信中フラグ（連打防止）
+  // -----------------------
   final Set<int> _likeSending = <int>{};
 
-  // ✅ active の1件だけプレイヤーを持つ（複数再生しない）
-  final Map<int, YoutubePlayerController> _ytControllers = {};
+  // ✅ サーバーから返ってきたlike数を投稿IDごとに保持（表示用）
+  //    ここがあるから「全リロードなし」で数字だけ変えられる
+  final Map<int, int> _likeCountById = {};
 
   @override
   void initState() {
@@ -38,6 +61,7 @@ class _TimelineScreenState extends State<TimelineScreen> {
     _futurePosts = _api.fetchAllPosts();
   }
 
+  /// 引っ張って更新（手動リロード用）
   Future<void> _reload() async {
     _safeSetState(() {
       _futurePosts = _api.fetchAllPosts();
@@ -56,7 +80,7 @@ class _TimelineScreenState extends State<TimelineScreen> {
     return url;
   }
 
-  // ✅ URLでもIDでもOK（正規表現なし）
+  /// ✅ URLでもIDでもOK（正規表現なし）
   String? _videoIdOrNull(Post post) {
     final raw = post.youtubeId ?? post.pageVideoId;
     if (raw == null) return null;
@@ -72,10 +96,10 @@ class _TimelineScreenState extends State<TimelineScreen> {
     final c = YoutubePlayerController(
       initialVideoId: videoId,
       flags: const YoutubePlayerFlags(
-        autoPlay: true, // ✅ active になったら自動再生
-        mute: true, // ✅ 勝手に爆音事故防止（必要なら後で false）
+        autoPlay: true,
+        mute: true,
         loop: true,
-        hideControls: true, // ✅ 再生UIいらない
+        hideControls: true,
         disableDragSeek: true,
         controlsVisibleAtStart: false,
       ),
@@ -85,6 +109,69 @@ class _TimelineScreenState extends State<TimelineScreen> {
     return c;
   }
 
+  /// ============================================================
+  /// ✅ いいね：押した瞬間に数字を +1/-1 して体感を良くする
+  ///
+  /// - LikeStore.toggle(post) で「ハート色」は即変わる
+  /// - _likeCountById[post.id] で「数字」も即変える
+  /// - サーバー通信成功 → サーバーの値で確定
+  /// - 失敗 → 元に戻す
+  ///
+  /// ※注意：あなたのAPIは「like加算」だけっぽいので
+  ///   - いいねONの時だけ _api.sendLike() を叩く
+  ///   - OFFはローカル表示だけ（サーバー側のunlikeがないため）
+  /// ============================================================
+  Future<void> _handleLikePressed(Post post) async {
+    final postId = post.id;
+
+    // 送信中なら連打禁止
+    if (_likeSending.contains(postId)) return;
+
+    final wasLiked = LikeStore.isLiked(post);
+
+    // 現在表示しているlike数（サーバー確定値があればそれを優先）
+    final beforeCount = _likeCountById[postId] ?? post.likeCount;
+
+    // 押した瞬間の「体感」用（+1/-1）
+    final optimisticCount = (beforeCount + (wasLiked ? -1 : 1)).clamp(0, 1 << 31);
+
+    // ✅ まずUIを即更新（ここで体感が良くなる）
+    _safeSetState(() {
+      _likeSending.add(postId);
+      LikeStore.toggle(post); // ハートを即反転
+      _likeCountById[postId] = optimisticCount; // 数字も即反映
+    });
+
+    try {
+      // サーバーに送るのは「いいねON」の時だけ
+      if (!wasLiked) {
+        final newCount = await _api.sendLike(postId);
+
+        if (!mounted) return;
+        _safeSetState(() {
+          _likeCountById[postId] = newCount; // ✅ サーバーの値で確定
+        });
+      }
+    } catch (e) {
+      debugPrint('Like error: $e');
+      if (!mounted) return;
+
+      // 失敗したら元に戻す
+      _safeSetState(() {
+        LikeStore.toggle(post); // 反転したのを戻す
+        _likeCountById[postId] = beforeCount; // 数字も戻す
+      });
+    } finally {
+      if (!mounted) return;
+      _safeSetState(() {
+        _likeSending.remove(postId);
+      });
+    }
+  }
+
+  /// ============================================================
+  /// 動画：VisibilityDetectorで「一番見えてる投稿」をactiveにする
+  /// ============================================================
   void _onVisibilityChanged(int postId, double visibleFraction) {
     if (visibleFraction <= 0) {
       _visibleMapByPostId.remove(postId);
@@ -106,7 +193,7 @@ class _TimelineScreenState extends State<TimelineScreen> {
     if (maxPostId != null && maxPostId != _activePostId && maxVisible > 0.3) {
       _safeSetState(() => _activePostId = maxPostId);
 
-      // ✅ active 以外は「絶対再生しない」＝ pause + dispose
+      // ✅ active 以外はpause+dispose（=絶対再生しない）
       _ytControllers.removeWhere((id, c) {
         final remove = id != _activePostId;
         if (remove) {
@@ -133,27 +220,22 @@ class _TimelineScreenState extends State<TimelineScreen> {
         ),
         child: const Text(
           'NEW',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 12,
-            fontWeight: FontWeight.bold,
-          ),
+          style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
         ),
       ),
     );
   }
 
-  /// ✅ カード上部：動画があれば動画（active の1件だけ自動再生）／なければ画像
+  /// カード上部：動画があれば動画（activeの1件だけ再生）／なければ画像
   Widget? _buildTopMedia(Post post) {
     final vid = _videoIdOrNull(post);
 
     // ---- 動画がある場合 ----
     if (vid != null) {
-      // active の時だけプレイヤーを出す（＝1件だけ再生）
+      // activeの時だけプレイヤーを出す（=1件だけ再生）
       if (_activePostId == post.id) {
         final controller = _getOrCreateYtController(post, vid);
 
-        // 念のため active になった瞬間に play を叩く（autoPlay保険）
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
           if (_activePostId == post.id) {
@@ -167,10 +249,7 @@ class _TimelineScreenState extends State<TimelineScreen> {
             children: [
               AspectRatio(
                 aspectRatio: 16 / 9,
-                child: YoutubePlayer(
-                  controller: controller,
-                  showVideoProgressIndicator: false,
-                ),
+                child: YoutubePlayer(controller: controller, showVideoProgressIndicator: false),
               ),
               if (_isNew(post)) _newBadge(),
             ],
@@ -178,7 +257,7 @@ class _TimelineScreenState extends State<TimelineScreen> {
         );
       }
 
-      // active じゃない時：YouTubeサムネだけ（▶︎マーク出さない）
+      // activeじゃない：サムネだけ
       final thumb = 'https://i.ytimg.com/vi/$vid/hqdefault.jpg';
       return ClipRRect(
         borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
@@ -189,10 +268,8 @@ class _TimelineScreenState extends State<TimelineScreen> {
               child: CachedNetworkImage(
                 imageUrl: thumb,
                 fit: BoxFit.cover,
-                placeholder: (_, __) =>
-                    const Center(child: CircularProgressIndicator()),
-                errorWidget: (_, __, ___) =>
-                    const Center(child: Icon(Icons.broken_image)),
+                placeholder: (_, __) => const Center(child: CircularProgressIndicator()),
+                errorWidget: (_, __, ___) => const Center(child: Icon(Icons.broken_image)),
               ),
             ),
             if (_isNew(post)) _newBadge(),
@@ -214,10 +291,8 @@ class _TimelineScreenState extends State<TimelineScreen> {
             child: CachedNetworkImage(
               imageUrl: img,
               fit: BoxFit.cover,
-              placeholder: (_, __) =>
-                  const Center(child: CircularProgressIndicator()),
-              errorWidget: (_, __, ___) =>
-                  const Center(child: Icon(Icons.broken_image)),
+              placeholder: (_, __) => const Center(child: CircularProgressIndicator()),
+              errorWidget: (_, __, ___) => const Center(child: Icon(Icons.broken_image)),
             ),
           ),
           if (_isNew(post)) _newBadge(),
@@ -238,154 +313,116 @@ class _TimelineScreenState extends State<TimelineScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('GameWidth Timeline')),
-      body: RefreshIndicator(
-        onRefresh: _reload,
-        child: FutureBuilder<List<Post>>(
-          future: _futurePosts,
-          builder: (context, snapshot) {
-            if (snapshot.connectionState == ConnectionState.waiting) {
-              return const Center(child: CircularProgressIndicator());
-            }
-            if (snapshot.hasError) {
-              return Center(child: Text('読み込みエラー: ${snapshot.error}'));
-            }
+    return RefreshIndicator(
+      onRefresh: _reload,
+      child: FutureBuilder<List<Post>>(
+        future: _futurePosts,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return Center(child: Text('読み込みエラー: ${snapshot.error}'));
+          }
 
-            final all = snapshot.data ?? [];
-            final posts = all.where((p) => p.showInHomepage == true).toList();
+          final all = snapshot.data ?? [];
+          final posts = all.where((p) => p.showInHomepage == true).toList();
 
-            if (posts.isEmpty) {
-              return const Center(child: Text('まだ投稿がありません'));
-            }
-
-            return ListView.builder(
-              padding: const EdgeInsets.all(12),
+          // 空でも引っ張って更新できるようにする
+          if (posts.isEmpty) {
+            return ListView(
               physics: const AlwaysScrollableScrollPhysics(),
-              itemCount: posts.length,
-              itemBuilder: (context, index) {
-                final post = posts[index];
+              children: const [
+                SizedBox(height: 120),
+                Center(child: Text('まだ投稿がありません')),
+              ],
+            );
+          }
 
-                final liked = LikeStore.isLiked(post);
-                final sending = _likeSending.contains(post.id);
+          return ListView.builder(
+            padding: const EdgeInsets.all(12),
+            physics: const AlwaysScrollableScrollPhysics(),
+            itemCount: posts.length,
+            itemBuilder: (context, index) {
+              final post = posts[index];
 
-                final topMedia = _buildTopMedia(post);
+              final liked = LikeStore.isLiked(post);
+              final sending = _likeSending.contains(post.id);
 
-                return VisibilityDetector(
-                  key: Key('post-${post.id}'),
-                  onVisibilityChanged: (info) {
-                    _onVisibilityChanged(post.id, info.visibleFraction);
+              final topMedia = _buildTopMedia(post);
+
+              return VisibilityDetector(
+                key: Key('post-${post.id}'),
+                onVisibilityChanged: (info) {
+                  _onVisibilityChanged(post.id, info.visibleFraction);
+                },
+                child: InkWell(
+                  onTap: () {
+                    Navigator.of(
+                      context,
+                    ).push(MaterialPageRoute(builder: (_) => PostDetailScreen(post: post)));
                   },
-                  child: InkWell(
-                    onTap: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => PostDetailScreen(post: post),
-                        ),
-                      );
-                    },
-                    borderRadius: BorderRadius.circular(16),
-                    child: Card(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          if (topMedia != null) topMedia,
-                          Padding(
-                            padding: const EdgeInsets.all(12),
-                            child: Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        post.title,
-                                        style: const TextStyle(
-                                          fontSize: 16,
-                                          fontWeight: FontWeight.bold,
-                                        ),
+                  borderRadius: BorderRadius.circular(16),
+                  child: Card(
+                    margin: const EdgeInsets.only(bottom: 12),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (topMedia != null) topMedia,
+                        Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      post.title,
+                                      style: const TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.bold,
                                       ),
-                                      const SizedBox(height: 6),
-                                      Text(
-                                        '${post.date.toLocal()}'
-                                            .split(' ')
-                                            .first,
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: Colors.grey.shade600,
-                                        ),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      '${post.date.toLocal()}'.split(' ').first,
+                                      style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      // ✅ 表示は「サーバー確定値があればそれ優先」
+                                      'いいね！${_likeCountById[post.id] ?? post.likeCount}件',
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w500,
                                       ),
-                                      const SizedBox(height: 6),
-                                      Text(
-                                        'いいね！${post.likeCount}件',
-                                        style: const TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w500,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
+                                    ),
+                                  ],
                                 ),
-                                IconButton(
-                                  icon: Icon(
-                                    liked
-                                        ? Icons.favorite
-                                        : Icons.favorite_border,
-                                    color: liked ? Colors.red : Colors.grey,
-                                  ),
-                                  onPressed: sending
-                                      ? null
-                                      : () async {
-                                          final wasLiked = liked;
+                              ),
 
-                                          _safeSetState(() {
-                                            _likeSending.add(post.id);
-                                            LikeStore.toggle(post);
-                                          });
-
-                                          if (!wasLiked) {
-                                            try {
-                                              await _api.sendLike(post.id);
-                                              if (!mounted) return;
-                                              await _reload();
-                                            } catch (e) {
-                                              debugPrint('Like error: $e');
-                                              if (!mounted) return;
-                                              _safeSetState(() {
-                                                LikeStore.toggle(post);
-                                              });
-                                            } finally {
-                                              if (!mounted) return;
-                                              _safeSetState(() {
-                                                _likeSending.remove(post.id);
-                                              });
-                                            }
-                                          } else {
-                                            if (!mounted) return;
-                                            _safeSetState(() {
-                                              _likeSending.remove(post.id);
-                                            });
-                                          }
-                                        },
+                              // ✅ いいねボタン：リロードしない / 即増減
+                              IconButton(
+                                icon: Icon(
+                                  liked ? Icons.favorite : Icons.favorite_border,
+                                  color: liked ? Colors.red : Colors.grey,
                                 ),
-                              ],
-                            ),
+                                onPressed: sending ? null : () => _handleLikePressed(post),
+                              ),
+                            ],
                           ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
                   ),
-                );
-              },
-            );
-          },
-        ),
+                ),
+              );
+            },
+          );
+        },
       ),
     );
   }
